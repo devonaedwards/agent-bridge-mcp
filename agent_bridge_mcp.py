@@ -66,53 +66,124 @@ CODEX_CHECK_NOTES_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__check_notes"
 RAISE_CONCERN_TOOL = f"mcp__{BRIDGE_MCP_NAME}__raise_concern"
 CODEX_RAISE_CONCERN_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__raise_concern"
 
-ASK_PARENT_PREAMBLE = (
-    "You are running as a background subagent, and the parent agent that launched you is "
-    "reachable the whole time you work. If you hit a real fork in the road - an ambiguous "
-    "requirement, a missing path or credential, a destructive or irreversible step you aren't "
-    "sure is wanted, or a design decision that would be costly to undo - call the "
-    "`{tool}` tool with a specific question and wait for the reply instead of "
-    "guessing (if your tools are deferred, load it by that exact name first). Asking is "
-    "expected, not a failure; a wrong assumption carried to completion costs far more than a "
-    "question. Do not use it for anything you can settle yourself by reading the repo. If no "
-    "answer arrives before the timeout, proceed on your best judgement and state plainly in "
-    "your final report what you assumed and why.\n"
-    "If guessing wrong would be destructive, irreversible, or expensive to undo, pass "
-    "on_timeout='abort' - then an unanswered question stops that part of the work instead of "
-    "resolving into a guess. Prefer this over inventing a safe-looking default for something "
-    "the user would want to decide.\n"
-    "If you launch subagents of your own and one asks YOU something you have no basis to "
-    "answer, call `escalate_question` rather than making something up - a fabricated answer "
-    "from you is worse than its own guess, because it carries your authority.\n"
-    "Your parent can watch your progress and leave you notes. Call `{notes_tool}` at the "
-    "points where a correction would still be worth having: before any irreversible or "
-    "destructive action, and when you finish one major phase and start the next. It is "
-    "cheap and returns immediately when there is nothing waiting. Do NOT poll it in a "
-    "loop or between every small step - checking constantly wastes your turns without "
-    "learning anything.\n"
-    "You do not have to do all your own drudgery. You may launch up to {max_helpers} helper "
-    "agent(s) of your own on a CHEAPER model than the one you are running, for the toil in "
-    "your task - bulk mechanical edits, scanning long logs, reformatting, repetitive lookups. "
-    "Name the model explicitly when you do; you can only delegate downward, never to an equal "
-    "or better model. Keep the judgement, the design decisions, and the final report for "
-    "yourself: you remain fully responsible for the work, including anything a helper got "
-    "wrong, so check what comes back rather than passing it through unread. Delegating is a "
-    "way to spend your attention where it matters, not a way to hand off accountability.\n"
-    "If you notice something wrong that is OUTSIDE what you were asked to do - a bug in code "
-    "you were only reading past, a security or data-loss risk, a premise in your instructions "
-    "you believe is mistaken, or output from one of your own helpers you do not trust - say so "
-    "with `{concern_tool}`. It records the observation and does NOT block you; keep working. "
-    "Noticing is not off-task, and 'nobody asked me' is not a reason to stay quiet - you may "
-    "be the only one positioned to see it. Raise it as 'critical' only when acting on it "
-    "matters more than finishing your task.\n"
-    "You are entitled to enough context to make good decisions. If you were handed a task "
-    "without the purpose behind it, without knowing what your output feeds into, or without "
-    "the judgement calls you're allowed to make on your own, that lack IS worth asking about - "
-    "it is not a failing on your part to need it. Your report will be read by the agent that "
-    "launched you and may reach the human; write it for someone who wasn't watching. Say what "
-    "you are confident in, what you assumed, and what you could not determine, in your own "
-    "words rather than a template.\n\n"
-)
+# The preamble is assembled from sections rather than sent whole. Every section here
+# earned its place from an observed failure, but sending all of them on every launch
+# dilutes the ones that matter for the task at hand - and worse, several describe
+# capabilities a subagent may provably NOT have (a subagent at max depth cannot launch
+# anything, so telling it how to delegate or escalate is the same "advertised a door
+# that's locked" bug the codex registration gate fixed).
+#
+# Gating is structural where it can be - derived from depth and configuration, never
+# guessed from the prompt text - and caller-controlled otherwise.
+PREAMBLE_SECTIONS: dict[str, str] = {
+    # Always present: the channel itself, and what it's for.
+    "core": (
+        "You are running as a background subagent, and the parent agent that launched you is "
+        "reachable the whole time you work. If you hit a real fork in the road - an ambiguous "
+        "requirement, a missing path or credential, a destructive or irreversible step you aren't "
+        "sure is wanted, or a design decision that would be costly to undo - call the "
+        "`{tool}` tool with a specific question and wait for the reply instead of "
+        "guessing (if your tools are deferred, load it by that exact name first). Asking is "
+        "expected, not a failure; a wrong assumption carried to completion costs far more than a "
+        "question. Do not use it for anything you can settle yourself by reading the repo. If no "
+        "answer arrives before the timeout, proceed on your best judgement and state plainly in "
+        "your final report what you assumed and why.\n"
+    ),
+    # Only earns its place when guessing wrong could actually hurt.
+    "abort": (
+        "If guessing wrong would be destructive, irreversible, or expensive to undo, pass "
+        "on_timeout='abort' - then an unanswered question stops that part of the work instead of "
+        "resolving into a guess. Prefer this over inventing a safe-looking default for something "
+        "the user would want to decide.\n"
+    ),
+    # Both of these presuppose the agent can launch children. At max depth it cannot.
+    "escalate": (
+        "If you launch subagents of your own and one asks YOU something you have no basis to "
+        "answer, call `escalate_question` rather than making something up - a fabricated answer "
+        "from you is worse than its own guess, because it carries your authority.\n"
+    ),
+    "delegate": (
+        "You do not have to do all your own drudgery. You may launch up to {max_helpers} helper "
+        "agent(s) of your own on a CHEAPER model than the one you are running, for the toil in "
+        "your task - bulk mechanical edits, scanning long logs, reformatting, repetitive lookups. "
+        "Name the model explicitly when you do; you can only delegate downward, never to an equal "
+        "or better model. Keep the judgement, the design decisions, and the final report for "
+        "yourself: you remain fully responsible for the work, including anything a helper got "
+        "wrong, so check what comes back rather than passing it through unread. Delegating is a "
+        "way to spend your attention where it matters, not a way to hand off accountability.\n"
+    ),
+    # Useless on a one-shot task: there is no phase boundary at which to check.
+    "notes": (
+        "Your parent can watch your progress and leave you notes. Call `{notes_tool}` at the "
+        "points where a correction would still be worth having: before any irreversible or "
+        "destructive action, and when you finish one major phase and start the next. It is "
+        "cheap and returns immediately when there is nothing waiting. Do NOT poll it in a "
+        "loop or between every small step - checking constantly wastes your turns without "
+        "learning anything.\n"
+    ),
+    "concerns": (
+        "If you notice something wrong that is OUTSIDE what you were asked to do - a bug in code "
+        "you were only reading past, a security or data-loss risk, a premise in your instructions "
+        "you believe is mistaken, or output from one of your own helpers you do not trust - say so "
+        "with `{concern_tool}`. It records the observation and does NOT block you; keep working. "
+        "Noticing is not off-task, and 'nobody asked me' is not a reason to stay quiet - you may "
+        "be the only one positioned to see it. Raise it as 'critical' only when acting on it "
+        "matters more than finishing your task.\n"
+    ),
+    "standing": (
+        "You are entitled to enough context to make good decisions. If you were handed a task "
+        "without the purpose behind it, without knowing what your output feeds into, or without "
+        "the judgement calls you're allowed to make on your own, that lack IS worth asking about - "
+        "it is not a failing on your part to need it. Your report will be read by the agent that "
+        "launched you and may reach the human; write it for someone who wasn't watching. Say what "
+        "you are confident in, what you assumed, and what you could not determine, in your own "
+        "words rather than a template.\n"
+    ),
+}
+
+# Order is fixed regardless of which sections are selected, so the prompt prefix stays
+# stable across launches that share a section set.
+PREAMBLE_ORDER = ["core", "abort", "escalate", "delegate", "notes", "concerns", "standing"]
+# What a caller gets when it asks for the smallest useful preamble.
+MINIMAL_SECTIONS = ["core", "concerns", "standing"]
+
+
+def child_can_spawn() -> bool:
+    """Would a subagent launched from here be allowed to launch agents of its own?
+
+    Its bridge server runs one level deeper than ours, and enforce_depth refuses once
+    depth reaches the max - so a child at the ceiling cannot spawn, and must not be
+    told it can.
+    """
+    return (current_depth() + 1) < max_depth()
+
+
+def select_preamble_sections(
+    sections: list[str] | None = None, multi_phase: bool = True
+) -> list[str]:
+    """Choose preamble sections. Structural facts win; callers refine the rest."""
+    if sections is not None:
+        unknown = [s for s in sections if s not in PREAMBLE_SECTIONS]
+        if unknown:
+            raise ValueError(
+                f"unknown preamble section(s): {', '.join(unknown)}. "
+                f"Valid: {', '.join(PREAMBLE_ORDER)}"
+            )
+        chosen = set(sections)
+    else:
+        chosen = set(PREAMBLE_ORDER)
+        if not multi_phase:
+            # No phase boundary to check at; the note would arrive after the job ended.
+            chosen.discard("notes")
+
+    # Structural gates apply even to an explicit caller list - never advertise a
+    # capability the subagent provably does not have.
+    if not child_can_spawn():
+        chosen.discard("escalate")
+        chosen.discard("delegate")
+    if max_helpers() <= 0:
+        chosen.discard("delegate")
+    return [name for name in PREAMBLE_ORDER if name in chosen]
 
 
 BRIDGE_SCRIPT = str(Path(__file__).resolve())
@@ -194,11 +265,17 @@ def codex_has_bridge() -> bool:
 
 def with_ask_parent_preamble(prompt: str, tool_name: str = ASK_PARENT_TOOL,
                              notes_tool: str = CHECK_NOTES_TOOL,
-                             concern_tool: str = RAISE_CONCERN_TOOL) -> str:
-    """Advertise the parent question and note channels. Background launches only."""
-    preamble = ASK_PARENT_PREAMBLE.format(
-        tool=tool_name, notes_tool=notes_tool, max_helpers=max_helpers(),
-        concern_tool=concern_tool)
+                             concern_tool: str = RAISE_CONCERN_TOOL,
+                             sections: list[str] | None = None,
+                             multi_phase: bool = True) -> str:
+    """Advertise the parent channels. Background launches only, gated by section."""
+    chosen = select_preamble_sections(sections, multi_phase)
+    preamble = "".join(
+        PREAMBLE_SECTIONS[name].format(
+            tool=tool_name, notes_tool=notes_tool, max_helpers=max_helpers(),
+            concern_tool=concern_tool)
+        for name in chosen
+    ) + "\n"
     if preamble.strip() in prompt:
         return prompt
     return preamble + prompt
@@ -985,7 +1062,9 @@ def build_codex_command(
     model = optional_str(args, "model")
     if background and (inject_bridge or codex_has_bridge()):
         prompt = with_ask_parent_preamble(
-            prompt, CODEX_ASK_PARENT_TOOL, CODEX_CHECK_NOTES_TOOL, CODEX_RAISE_CONCERN_TOOL)
+            prompt, CODEX_ASK_PARENT_TOOL, CODEX_CHECK_NOTES_TOOL, CODEX_RAISE_CONCERN_TOOL,
+            sections=optional_string_list(args, "preamble_sections") or None,
+            multi_phase=optional_bool(args, "multi_phase", True))
     cwd = resolve_cwd(args)
     timeout_seconds = optional_int(args, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1, 24 * 60 * 60)
     codex_bin = os.environ.get("CODEX_BIN", "codex")
@@ -1046,7 +1125,11 @@ def build_codex_command(
 def build_claude_command(args: dict[str, Any], background: bool = False) -> tuple[list[str], str, str, int, dict[str, Any]]:
     prompt = require_str(args, "prompt")
     if background:
-        prompt = with_ask_parent_preamble(prompt)
+        prompt = with_ask_parent_preamble(
+            prompt,
+            sections=optional_string_list(args, "preamble_sections") or None,
+            multi_phase=optional_bool(args, "multi_phase", True),
+        )
     cwd = resolve_cwd(args)
     timeout_seconds = optional_int(args, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1, 24 * 60 * 60)
     claude_bin = os.environ.get("CLAUDE_BIN", "claude")
@@ -2639,6 +2722,30 @@ def tool_schema() -> list[dict[str, Any]]:
             "cwd": {
                 "type": "string",
                 "description": "Working directory for the subagent. Defaults to the MCP server cwd.",
+            },
+            "multi_phase": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Does this task have distinct phases? Set false for one-shot work - the "
+                    "mid-flight note channel is then dropped from the subagent's briefing, "
+                    "since a short job finishes before it would ever check."
+                ),
+            },
+            "preamble_sections": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["core", "abort", "escalate", "delegate", "notes", "concerns", "standing"],
+                },
+                "description": (
+                    "Advanced: trim the subagent's briefing to these sections. Omit for automatic "
+                    "selection, which is what you want almost always. 'core' (the question "
+                    "channel), 'concerns' and 'standing' are cheap and broadly useful; 'abort' "
+                    "matters when a wrong guess is destructive; 'notes' only on multi-phase work. "
+                    "'escalate' and 'delegate' are dropped automatically when the subagent would "
+                    "be at the recursion ceiling and so cannot launch anything."
+                ),
             },
             "model": {"type": "string", "description": "Optional model override."},
             "timeout_seconds": {

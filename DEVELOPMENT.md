@@ -97,6 +97,22 @@ hyphenated name sends the subagent grepping `ALL_TOOLS` to find it.
 JSON-RPC pipe and hang every subsequent request. Always `subprocess.DEVNULL` unless
 piping a prompt.
 
+## Adding a preamble section
+
+Sections live in `PREAMBLE_SECTIONS` and are assembled per launch by
+`select_preamble_sections()`. Add the text, add the name to `PREAMBLE_ORDER` (order is
+fixed regardless of selection, so a shared section set produces a stable prompt prefix),
+and decide its gate.
+
+Prefer a **structural** gate over a heuristic one. `escalate` and `delegate` are gated on
+`child_can_spawn()` — derived from depth and config, provable, and it can't drift. Do not
+gate by inspecting the prompt text: that is the same guess-at-the-environment pattern that
+produced the "advertised a tool that wasn't registered" bugs. If a section can't be gated
+structurally, expose a caller flag instead (`multi_phase`) and default it to on.
+
+Structural gates apply even to an explicit `preamble_sections` list — a caller must not be
+able to advertise a capability the subagent lacks.
+
 ## Adding a tool
 
 1. Write the handler `(args: dict) -> dict`, returning `tool_response(...)` or raising

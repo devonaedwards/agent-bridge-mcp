@@ -125,6 +125,36 @@ claude: fable-5 > opus-4-8 > opus-4-7 > opus-4-6 > sonnet-5 > sonnet-4-6 > haiku
 codex:  gpt-5.6-sol > gpt-5.6-terra > gpt-5.6-luna > gpt-5.5 > gpt-5.4 > gpt-5.4-mini
 ```
 
+## Trimming the subagent briefing
+
+Every background launch prepends a briefing covering the question channel, aborting,
+escalation, notes, delegation, concerns, and the agent's standing to ask for context.
+Each section earned its place from an observed failure, but sending all of them every
+time dilutes the ones that matter for the task in hand.
+
+**Structural gating is automatic and not overridable.** A subagent at the recursion
+ceiling cannot launch anything, so the `escalate` and `delegate` sections are dropped -
+telling it otherwise advertises a door that is locked. Same when `AGENT_BRIDGE_MAX_HELPERS`
+is 0. A caller cannot re-enable these; the gate wins over an explicit section list.
+
+**Caller controls:**
+
+```
+launch_claude_agent(prompt=..., multi_phase=False)          # drops the notes section
+launch_claude_agent(prompt=..., preamble_sections=[...])    # advanced: exact set
+```
+
+`multi_phase=False` is the one worth reaching for: a one-shot job finishes before it
+would ever hit a phase boundary, so the note channel is pure overhead. Sections are
+`core`, `abort`, `escalate`, `delegate`, `notes`, `concerns`, `standing`; omit
+`preamble_sections` for automatic selection, which is right almost always.
+
+Observed: a trimmed briefing (`core` + `concerns` + `standing`, single-phase — 44%
+smaller) still produced the behavior it kept. The agent given a line-counting task
+flagged a `shutil.rmtree("/")` in the file as critical, exactly as under the full
+briefing. Trimming the sections you don't need does not appear to cost the ones you do —
+but that is one observation, not a guarantee.
+
 ## Continue a finished agent
 
 Both kinds keep their sessions, so a finished job can be picked back up:

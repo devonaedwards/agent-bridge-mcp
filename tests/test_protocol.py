@@ -322,14 +322,75 @@ def test_concerns() -> None:
                 pass
 
 
+def test_preamble_gating_sections() -> None:
+    print("\npreamble section gating")
+    import os
+    saved = {k: os.environ.get(k) for k in ("AGENT_BRIDGE_DEPTH", "AGENT_BRIDGE_MAX_HELPERS")}
+    try:
+        os.environ["AGENT_BRIDGE_DEPTH"] = "0"
+        os.environ.pop("AGENT_BRIDGE_MAX_HELPERS", None)
+        full = ab.select_preamble_sections()
+        check("child below the ceiling gets everything", set(full) == set(ab.PREAMBLE_ORDER))
+        check("order is stable regardless of selection",
+              full == [s for s in ab.PREAMBLE_ORDER if s in set(full)])
+
+        # A one-shot job finishes before it would ever reach a phase boundary.
+        check("single-phase drops notes", "notes" not in ab.select_preamble_sections(multi_phase=False))
+
+        # Structural: a child at the recursion ceiling cannot launch anything, so telling
+        # it how to delegate or escalate advertises a door that is locked.
+        os.environ["AGENT_BRIDGE_DEPTH"] = str(ab.max_depth() - 1)
+        ceiling = ab.select_preamble_sections()
+        check("ceiling child loses escalate", "escalate" not in ceiling)
+        check("ceiling child loses delegate", "delegate" not in ceiling)
+        check("ceiling child keeps the question channel", "core" in ceiling)
+        check("structural gate overrides an explicit caller list",
+              "delegate" not in ab.select_preamble_sections(["core", "delegate"]),
+              "a caller must not be able to advertise a capability the child lacks")
+
+        os.environ["AGENT_BRIDGE_DEPTH"] = "0"
+        os.environ["AGENT_BRIDGE_MAX_HELPERS"] = "0"
+        check("helpers disabled drops delegate", "delegate" not in ab.select_preamble_sections())
+        os.environ.pop("AGENT_BRIDGE_MAX_HELPERS")
+
+        try:
+            ab.select_preamble_sections(["core", "not-a-section"])
+            check("unknown section rejected", False, "no exception")
+        except ValueError as exc:
+            check("unknown section rejected", "not-a-section" in str(exc))
+
+        # Gating must shrink the prompt, and every section must still render.
+        big = ab.with_ask_parent_preamble("")
+        small = ab.with_ask_parent_preamble("", sections=ab.MINIMAL_SECTIONS)
+        check("minimal is materially smaller", len(small) < len(big) * 0.7)
+        for name in ab.PREAMBLE_ORDER:
+            rendered = ab.PREAMBLE_SECTIONS[name].format(
+                tool="T", notes_tool="N", concern_tool="C", max_helpers=2)
+            check(f"section '{name}' renders with no stray placeholder", "{" not in rendered)
+
+        cmd_args = {"prompt": "t", "cwd": "/tmp", "multi_phase": False}
+        _, trimmed, *_ = ab.build_claude_command(cmd_args, background=True)
+        check("launch_claude_agent honors multi_phase", ab.CHECK_NOTES_TOOL not in trimmed)
+        _, codex_trimmed, *_ = ab.build_codex_command(cmd_args, background=True, job_id="J")
+        check("launch_codex_agent honors multi_phase", ab.CODEX_CHECK_NOTES_TOOL not in codex_trimmed)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_on_timeout_schema() -> None:
     print("\non_timeout")
     schema = next(t for t in ab.tool_schema() if t["name"] == "ask_parent")
     prop = schema["inputSchema"]["properties"].get("on_timeout", {})
     check("on_timeout exposed", set(prop.get("enum", [])) == {"proceed", "abort"})
     check("defaults to proceed", prop.get("default") == "proceed")
-    check("preamble teaches abort", "abort" in ab.ASK_PARENT_PREAMBLE)
-    check("preamble teaches escalation", "escalate_question" in ab.ASK_PARENT_PREAMBLE)
+    # Assert on the RENDERED preamble - sections are assembled per launch now.
+    rendered = ab.with_ask_parent_preamble("task")
+    check("preamble teaches abort", "abort" in rendered)
+    check("preamble teaches escalation", "escalate_question" in ab.PREAMBLE_SECTIONS["escalate"])
 
 
 def test_transcript_parsers() -> None:
@@ -368,6 +429,7 @@ if __name__ == "__main__":
     test_supervision_notes()
     test_delegation()
     test_concerns()
+    test_preamble_gating_sections()
     test_on_timeout_schema()
     test_transcript_parsers()
 
