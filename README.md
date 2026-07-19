@@ -25,6 +25,8 @@ sessions you can pick up yourself in a terminal.
 - `peek_agent` - watch a running subagent's progress without waiting for it.
 - `ask_parent` - **subagent-side**: ask the launching parent a question and block.
 - `pending_questions` / `answer_agent` - **parent-side**: see and answer those questions.
+- `escalate_question` - **parent-side**: pass a question up when you can't answer it either.
+- `send_note` / `check_notes` - redirect a running subagent mid-flight.
 
 ## Watching a subagent (`peek_agent`)
 

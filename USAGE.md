@@ -52,6 +52,34 @@ Good tasks to launch this way are ones where a wrong assumption is expensive:
 destructive operations, ambiguous scope, anything touching credentials or production.
 The agent decides whether to ask; a task with no real ambiguity will just proceed.
 
+## Redirect an agent mid-flight
+
+`peek_agent` shows you an agent heading somewhere wrong; `send_note` redirects it
+without losing the work already done.
+
+```
+peek_agent(job_id)                        -> see it going wrong
+send_note(job_id, note="do X instead")    -> queued
+```
+
+**Delivery is not immediate and not guaranteed.** A launched agent is a one-shot
+process with no stdin, so there is no way to interrupt it. The note sits in a mailbox
+the agent reads at the points where a correction is still worth having: before an
+irreversible action, and at phase boundaries. If it is mid-step you wait for that step
+to end; if the job is short it may finish having never checked.
+
+That means notes work well for multi-phase work and badly for anything quick. For a
+job that has already finished, use `continue_*` instead — `send_note` refuses, since
+a finished agent will never read it.
+
+Write the note as a correction with a reason. The subagent is told it supersedes its
+current plan where they conflict, so a vague note produces worse results than none.
+
+Observed working: an agent given a 4-phase task checked at the phase-1 boundary, took
+a note redirecting phases 2-4, applied it to exactly those, and left phase 1 alone. It
+also noted in its report that it had *not* checked between phases 2 and 3 — so a note
+landing in that window would have arrived one phase late. That gap is inherent.
+
 ## Continue a finished agent
 
 Both kinds keep their sessions, so a finished job can be picked back up:

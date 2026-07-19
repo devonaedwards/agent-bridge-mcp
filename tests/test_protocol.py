@@ -173,6 +173,54 @@ def test_escalation() -> None:
         (ab.QUESTIONS_DIR / "Q-ESC.json").unlink(missing_ok=True)
 
 
+def test_supervision_notes() -> None:
+    print("\nsupervision notes")
+    import os
+    job_id = "JOB-NOTES"
+    os.environ["AGENT_BRIDGE_JOB_ID"] = job_id
+    try:
+        ab._write_notes(job_id, [])
+        # A note to a finished job would never be read - fail loudly instead of silently
+        # queueing it, and point at the tool that does work on a finished job.
+        try:
+            ab.send_note({"job_id": "no-such-job", "note": "x"})
+            check("send_note rejects unknown job", False, "no exception")
+        except ValueError as exc:
+            check("send_note rejects unknown job", "unknown job_id" in str(exc))
+
+        ab._write_notes(job_id, [{"note_id": "n1", "note": "switch to weather",
+                                  "sent_at": time.time(), "read_at": None}])
+        first = json.loads(ab.check_notes({})["content"][0]["text"])
+        check("check_notes returns unread", first["count"] == 1)
+        check("note text delivered", first["notes"][0]["note"] == "switch to weather")
+        check("delivery carries precedence instruction", "supersedes" in first.get("instruction", ""))
+
+        second = json.loads(ab.check_notes({})["content"][0]["text"])
+        check("notes are marked read once delivered", second["count"] == 0,
+              "re-delivering would make an agent apply the same correction repeatedly")
+
+        saved = os.environ.pop("AGENT_BRIDGE_JOB_ID")
+        try:
+            ab.check_notes({})
+            check("check_notes needs a job id", False, "no exception")
+        except ValueError:
+            check("check_notes needs a job id", True)
+        finally:
+            os.environ["AGENT_BRIDGE_JOB_ID"] = saved
+
+        # The template carries a {notes_tool} placeholder, so assert on the FORMATTED
+        # preamble - what the subagent actually receives.
+        rendered = ab.with_ask_parent_preamble("task")
+        check("preamble teaches check_notes", ab.CHECK_NOTES_TOOL in rendered)
+        check("preamble warns against polling", "loop" in rendered)
+        cmd, _, *_ = ab.build_claude_command(
+            {"prompt": "t", "cwd": "/tmp", "allowed_tools": ["Bash"]}, background=True)
+        check("check_notes force-added to allowlist", ab.CHECK_NOTES_TOOL in " ".join(cmd))
+    finally:
+        os.environ.pop("AGENT_BRIDGE_JOB_ID", None)
+        (ab.NOTES_DIR / f"{job_id}.json").unlink(missing_ok=True)
+
+
 def test_on_timeout_schema() -> None:
     print("\non_timeout")
     schema = next(t for t in ab.tool_schema() if t["name"] == "ask_parent")
@@ -216,6 +264,7 @@ if __name__ == "__main__":
     test_preamble_gating()
     test_codex_overrides()
     test_escalation()
+    test_supervision_notes()
     test_on_timeout_schema()
     test_transcript_parsers()
 

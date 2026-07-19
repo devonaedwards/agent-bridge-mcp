@@ -61,6 +61,8 @@ BRIDGE_MCP_NAME = "agent-bridge"
 CODEX_BRIDGE_MCP_NAME = "agent_bridge"
 ASK_PARENT_TOOL = f"mcp__{BRIDGE_MCP_NAME}__ask_parent"
 CODEX_ASK_PARENT_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__ask_parent"
+CHECK_NOTES_TOOL = f"mcp__{BRIDGE_MCP_NAME}__check_notes"
+CODEX_CHECK_NOTES_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__check_notes"
 
 ASK_PARENT_PREAMBLE = (
     "You are running as a background subagent, and the parent agent that launched you is "
@@ -80,6 +82,12 @@ ASK_PARENT_PREAMBLE = (
     "If you launch subagents of your own and one asks YOU something you have no basis to "
     "answer, call `escalate_question` rather than making something up - a fabricated answer "
     "from you is worse than its own guess, because it carries your authority.\n"
+    "Your parent can watch your progress and leave you notes. Call `{notes_tool}` at the "
+    "points where a correction would still be worth having: before any irreversible or "
+    "destructive action, and when you finish one major phase and start the next. It is "
+    "cheap and returns immediately when there is nothing waiting. Do NOT poll it in a "
+    "loop or between every small step - checking constantly wastes your turns without "
+    "learning anything.\n"
     "You are entitled to enough context to make good decisions. If you were handed a task "
     "without the purpose behind it, without knowing what your output feeds into, or without "
     "the judgement calls you're allowed to make on your own, that lack IS worth asking about - "
@@ -166,9 +174,10 @@ def codex_has_bridge() -> bool:
     return "mcp_servers" in text and "agent_bridge_mcp.py" in text
 
 
-def with_ask_parent_preamble(prompt: str, tool_name: str = ASK_PARENT_TOOL) -> str:
-    """Advertise the parent question channel. Background-launched subagents only."""
-    preamble = ASK_PARENT_PREAMBLE.format(tool=tool_name)
+def with_ask_parent_preamble(prompt: str, tool_name: str = ASK_PARENT_TOOL,
+                             notes_tool: str = CHECK_NOTES_TOOL) -> str:
+    """Advertise the parent question and note channels. Background launches only."""
+    preamble = ASK_PARENT_PREAMBLE.format(tool=tool_name, notes_tool=notes_tool)
     if preamble.strip() in prompt:
         return prompt
     return preamble + prompt
@@ -612,6 +621,104 @@ def answer_agent(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+# ---------------------------------------------------------------------------
+# Supervision notes: parent -> running subagent, one way.
+#
+# A launched subagent is a one-shot process with stdin at DEVNULL, so there is no
+# channel to interrupt it. The only workable shape is a mailbox the agent chooses to
+# read. Timing is the whole design problem: polling on a timer burns calls to learn
+# nothing, so the preamble ties checks to the moments a correction is worth having -
+# before an irreversible action, and at phase boundaries.
+#
+# EXPERIMENTAL. Whether agents check at useful moments is an empirical question.
+# ---------------------------------------------------------------------------
+
+NOTES_DIR = STATE_DIR / "notes"
+
+
+def _notes_path(job_id: str) -> Path:
+    NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    return NOTES_DIR / f"{job_id}.json"
+
+
+def _read_notes(job_id: str) -> list[dict[str, Any]]:
+    try:
+        return json.loads(_notes_path(job_id).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _write_notes(job_id: str, notes: list[dict[str, Any]]) -> None:
+    target = _notes_path(job_id)
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(notes, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def send_note(args: dict[str, Any]) -> dict[str, Any]:
+    """Parent-side: leave a note for a RUNNING subagent to pick up at its next check."""
+    job_id = require_str(args, "job_id")
+    note = require_str(args, "note")
+    job = get_job(job_id)
+    with job.lock:
+        status = job.status
+    if status != "running":
+        raise ValueError(
+            f"job {job_id} is {status}, not running - it will never read this note. "
+            "Use continue_claude_agent / continue_codex_agent to send a follow-up turn "
+            "to a finished job instead."
+        )
+    notes = _read_notes(job_id)
+    notes.append({
+        "note_id": str(uuid.uuid4()),
+        "note": note,
+        "sent_at": time.time(),
+        "read_at": None,
+    })
+    _write_notes(job_id, notes)
+    return tool_response({
+        "job_id": job_id,
+        "queued": True,
+        "unread": sum(1 for n in notes if not n.get("read_at")),
+        "note": (
+            "Delivered when the subagent next calls check_notes - it is told to do that "
+            "before irreversible actions and at phase boundaries, NOT continuously. A "
+            "note is not an interrupt; if the agent is mid-step it will not see this "
+            "until that step ends, and it may never see it if it finishes first."
+        ),
+    })
+
+
+def check_notes(args: dict[str, Any]) -> dict[str, Any]:
+    """Subagent-side: read any notes the parent has left. Non-blocking."""
+    job_id = os.environ.get("AGENT_BRIDGE_JOB_ID")
+    if not job_id:
+        raise ValueError(
+            "check_notes is only available to a background-launched subagent "
+            "(launch_claude_agent / launch_codex_agent)."
+        )
+    notes = _read_notes(job_id)
+    unread = [n for n in notes if not n.get("read_at")]
+    if not unread:
+        return tool_response({"notes": [], "count": 0})
+    now = time.time()
+    for n in notes:
+        if not n.get("read_at"):
+            n["read_at"] = now
+    _write_notes(job_id, notes)
+    return tool_response({
+        "notes": [{"note": n["note"], "sent_at": n["sent_at"]} for n in unread],
+        "count": len(unread),
+        "instruction": (
+            "Your parent is watching your progress and sent this. Treat it as a "
+            "correction that supersedes your current plan where they conflict - it was "
+            "written with visibility into what you have actually been doing. If it "
+            "contradicts your original instructions, follow the note and say so in your "
+            "final report."
+        ),
+    })
+
+
 def command_preview(command: list[str]) -> list[str]:
     preview = list(command)
     if preview and preview[-1] == "-":
@@ -629,7 +736,7 @@ def build_codex_command(
     # injecting it for this invocation (job_id present), or it's in the user's config.
     inject_bridge = bool(background and job_id)
     if background and (inject_bridge or codex_has_bridge()):
-        prompt = with_ask_parent_preamble(prompt, CODEX_ASK_PARENT_TOOL)
+        prompt = with_ask_parent_preamble(prompt, CODEX_ASK_PARENT_TOOL, CODEX_CHECK_NOTES_TOOL)
     cwd = resolve_cwd(args)
     timeout_seconds = optional_int(args, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1, 24 * 60 * 60)
     codex_bin = os.environ.get("CODEX_BIN", "codex")
@@ -714,8 +821,10 @@ def build_claude_command(args: dict[str, Any], background: bool = False) -> tupl
     # An allowlist is exhaustive: if the caller passed one and forgot ask_parent, the
     # subagent is told it can ask (via the preamble) and then blocked from doing so.
     # Add it back rather than let that contradiction ship.
-    if background and allowed_tools and ASK_PARENT_TOOL not in allowed_tools:
-        allowed_tools = [*allowed_tools, ASK_PARENT_TOOL]
+    if background and allowed_tools:
+        for required in (ASK_PARENT_TOOL, CHECK_NOTES_TOOL):
+            if required not in allowed_tools:
+                allowed_tools = [*allowed_tools, required]
     extra_args = optional_string_list(args, "extra_args")
 
     command = [
@@ -2234,6 +2343,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "pending_questions": pending_questions,
     "answer_agent": answer_agent,
     "escalate_question": escalate_question,
+    "send_note": send_note,
+    "check_notes": check_notes,
     "codex_usage": codex_usage,
     "codex_status": codex_status,
     "claude_usage": claude_usage,
@@ -2638,6 +2749,44 @@ def tool_schema() -> list[dict[str, Any]]:
                 },
                 "additionalProperties": False,
             },
+        },
+        {
+            "name": "send_note",
+            "description": (
+                "PARENT-SIDE. Leave a course-correction for a RUNNING subagent, picked up at "
+                "its next check. Use with peek_agent when you can see it heading somewhere "
+                "wrong and would rather redirect it than let it finish and redo the work. "
+                "This is NOT an interrupt: the subagent reads notes before irreversible "
+                "actions and at phase boundaries, so delivery is not immediate and a "
+                "short-lived job may finish without ever reading it. For a job that has "
+                "already finished, use continue_claude_agent / continue_codex_agent instead."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The running job to redirect."},
+                    "note": {
+                        "type": "string",
+                        "description": (
+                            "The correction. Say what to do differently and why - the subagent "
+                            "is told this supersedes its plan where they conflict, so vague "
+                            "notes produce worse results than none."
+                        ),
+                    },
+                },
+                "required": ["job_id", "note"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "check_notes",
+            "description": (
+                "SUBAGENT-ONLY. Read any notes your parent has left while watching you. "
+                "Returns immediately; empty when there is nothing. Call it before any "
+                "irreversible or destructive action and at phase boundaries - not in a loop "
+                "and not between every small step."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
             "name": "escalate_question",
