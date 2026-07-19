@@ -71,13 +71,24 @@ Claude Code:
 claude mcp add -s user agent-bridge -- python3 /Users/devonedwards/src/agent-bridge-mcp/agent_bridge_mcp.py
 ```
 
-Codex (optional - only needed for top-level codex sessions):
+Codex - required if you want to START a session in codex and launch from there.
+Without it `codex mcp list` returns `[]` and codex has no bridge tools at all:
 
 ```bash
 codex mcp add agent-bridge -- python3 /Users/devonedwards/src/agent-bridge-mcp/agent_bridge_mcp.py
 ```
 
-Restart each client after registration.
+Then add to the generated `[mcp_servers.agent-bridge]` block, since codex's 60s
+default would kill a blocked `ask_parent`:
+
+```toml
+tool_timeout_sec = 3600
+startup_timeout_sec = 30
+```
+
+Restart each client after registration. Both directions work: claude can launch
+codex subagents and codex can launch claude subagents, and either can be the
+parent answering the other's questions.
 
 ### Codex subagents self-register
 

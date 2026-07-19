@@ -74,6 +74,15 @@ is a plain string.
 | Values are TOML, not JSON | `expected struct RawMcpServerConfig` |
 | `default_tools_approval_mode="approve"` | Calls denied as `"user cancelled"` in 0.0s |
 | `tool_timeout_sec` > `ask_parent` timeout | Blocked call killed at 60s |
+| `-c` key must MATCH the config.toml key | Duplicate server, hashed tool names |
+
+That last one is subtle. `-c` merges into an entry with the same key but registers a
+*second* server under a different one — and since codex normalizes `-` to `_`, both
+collapse to `agent_bridge` and it disambiguates with hash suffixes
+(`mcp__agent_bridge_529cc70a97db__launch_claude_agent`). Tool names then vary per
+launch and subagents have to grep `ALL_TOOLS` for every call. So the injection uses the
+hyphenated `agent-bridge` key to match `config.toml`, and lets codex's own
+normalization produce the `mcp__agent_bridge__*` tool names.
 
 `"auto"` looks like the right approval mode and is accepted, but it defers to the
 approval policy — and we launch codex with `--ask-for-approval never`, so it still denies.

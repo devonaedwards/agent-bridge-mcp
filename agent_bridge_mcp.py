@@ -125,7 +125,13 @@ def codex_bridge_overrides(job_id: str) -> list[str]:
         f'AGENT_BRIDGE_MAX_DEPTH="{max_depth()}"',
         f'AGENT_BRIDGE_ANCESTRY="{",".join(ancestry)}"',
     ])
-    name = CODEX_BRIDGE_MCP_NAME
+    # Inject under the SAME key config.toml uses (hyphenated). Codex merges -c overrides
+    # into a matching entry but treats a different key as a SECOND server - and since it
+    # normalizes both to `agent_bridge`, the collision makes it disambiguate with hash
+    # suffixes (mcp__agent_bridge_529cc70a97db__...). Tool names then differ per launch
+    # and the subagent has to grep ALL_TOOLS to find anything. Matching keys avoids it,
+    # and codex's own normalization still yields the mcp__agent_bridge__* tool names.
+    name = BRIDGE_MCP_NAME
     return [
         "-c", f'mcp_servers.{name}.command="{sys.executable}"',
         "-c", f'mcp_servers.{name}.args=["{BRIDGE_SCRIPT}"]',

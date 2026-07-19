@@ -115,8 +115,13 @@ def test_codex_overrides() -> None:
     check("uses snake_case mcp_servers", "mcp_servers." in joined)
     check("never emits camelCase mcpServers", "mcpServers" not in joined,
           "codex IGNORES mcpServers silently - no error, server just never appears")
-    check("server name has no hyphen", f"mcp_servers.{ab.CODEX_BRIDGE_MCP_NAME}." in joined)
-    check("name is not quoted in the -c path", f'mcp_servers."' not in joined,
+    # Must match the key config.toml uses, or codex registers a SECOND server, both
+    # normalize to agent_bridge, and it disambiguates with per-launch hash suffixes.
+    check("injects under the config.toml key", f"mcp_servers.{ab.BRIDGE_MCP_NAME}." in joined)
+    check("does not inject a second underscore key",
+          f"mcp_servers.{ab.CODEX_BRIDGE_MCP_NAME}." not in joined,
+          "a differing key duplicates the server and produces hashed tool names")
+    check("name is not quoted in the -c path", 'mcp_servers."' not in joined,
           "quoting embeds the quote chars in the server name")
     check("approval mode is 'approve'", 'default_tools_approval_mode="approve"' in joined,
           "'auto' defers to --ask-for-approval never and still denies")
