@@ -221,6 +221,107 @@ def test_supervision_notes() -> None:
         (ab.NOTES_DIR / f"{job_id}.json").unlink(missing_ok=True)
 
 
+def test_delegation() -> None:
+    print("\ndelegation to cheaper models")
+    import os
+    check("codex ladder is most-capable-first", ab.codex_model_tiers()[0].endswith("sol"),
+          "cache order IS the capability order: sol > terra > luna")
+    check("claude ladder ranks opus above haiku",
+          ab.model_rank("claude", "claude-opus-4-8") < ab.model_rank("claude", "claude-haiku-4-5"))
+    check("context-window suffix is stripped",
+          ab.model_rank("claude", "claude-opus-4-8[1m]") == ab.model_rank("claude", "claude-opus-4-8"))
+
+    saved = {k: os.environ.get(k) for k in
+             ("AGENT_BRIDGE_JOB_ID", "AGENT_BRIDGE_MODEL", "AGENT_BRIDGE_PARENT")}
+    try:
+        os.environ.pop("AGENT_BRIDGE_JOB_ID", None)
+        ab._helpers_launched = 0
+        ab.enforce_delegation("claude", "claude-opus-4-8")
+        check("top-level launches are unrestricted", True)
+
+        os.environ.update({"AGENT_BRIDGE_JOB_ID": "J", "AGENT_BRIDGE_MODEL": "claude-sonnet-5",
+                           "AGENT_BRIDGE_PARENT": "claude"})
+        ab._helpers_launched = 0
+        for label, model in (("upward", "claude-opus-4-8"), ("sideways", "claude-sonnet-5")):
+            try:
+                ab.enforce_delegation("claude", model)
+                check(f"subagent blocked from delegating {label}", False, "allowed")
+            except RuntimeError as exc:
+                check(f"subagent blocked from delegating {label}", "DOWNWARD" in str(exc))
+        try:
+            ab.enforce_delegation("claude", None)
+            check("subagent must name a model", False, "allowed")
+        except ValueError:
+            check("subagent must name a model", True)
+
+        ab._helpers_launched = 0
+        ab.enforce_delegation("claude", "claude-haiku-4-5")
+        ab.enforce_delegation("claude", "claude-haiku-4-5")
+        check("two helpers allowed", ab._helpers_launched == 2)
+        try:
+            ab.enforce_delegation("claude", "claude-haiku-4-5")
+            check("third helper blocked", False, "allowed")
+        except RuntimeError as exc:
+            check("third helper blocked", "limit reached" in str(exc))
+
+        rendered = ab.with_ask_parent_preamble("task")
+        check("preamble offers delegation", "cheaper model" in rendered.lower())
+        check("preamble keeps accountability", "responsible for the work" in rendered)
+    finally:
+        ab._helpers_launched = 0
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_concerns() -> None:
+    print("\nconcerns (see something, say something)")
+    import os
+    saved = os.environ.get("AGENT_BRIDGE_JOB_ID")
+    os.environ["AGENT_BRIDGE_JOB_ID"] = "JOB-CONCERN"
+    try:
+        payload = json.loads(ab.raise_concern({
+            "concern": "rmtree on / in maintenance.py",
+            "evidence": "maintenance.py:11",
+            "severity": "critical",
+        })["content"][0]["text"])
+        check("records the concern", payload["recorded"] is True)
+        # The whole point is that it does NOT block - a blocking need is a question.
+        check("tells the agent it is not blocked", "NOT blocked" in payload.get("note", ""))
+        check("points blocking needs at ask_parent", "ask_parent" in payload.get("note", ""))
+
+        listed = json.loads(ab.list_concerns({"job_id": "JOB-CONCERN"})["content"][0]["text"])
+        check("parent can read it", listed["count"] == 1)
+        check("critical counted", listed["critical_count"] == 1)
+        filtered = json.loads(ab.list_concerns(
+            {"job_id": "JOB-CONCERN", "min_severity": "critical"})["content"][0]["text"])
+        check("severity filter works", filtered["count"] == 1)
+
+        os.environ.pop("AGENT_BRIDGE_JOB_ID")
+        try:
+            ab.raise_concern({"concern": "x"})
+            check("needs a job id", False, "no exception")
+        except ValueError:
+            check("needs a job id", True)
+
+        rendered = ab.with_ask_parent_preamble("task")
+        check("preamble empowers speaking up", "nobody asked me" in rendered)
+        check("preamble names the concern tool", ab.RAISE_CONCERN_TOOL in rendered)
+    finally:
+        if saved is None:
+            os.environ.pop("AGENT_BRIDGE_JOB_ID", None)
+        else:
+            os.environ["AGENT_BRIDGE_JOB_ID"] = saved
+        for f in ab.CONCERNS_DIR.glob("*.json"):
+            try:
+                if json.loads(f.read_text())["job_id"] == "JOB-CONCERN":
+                    f.unlink()
+            except (OSError, json.JSONDecodeError, KeyError):
+                pass
+
+
 def test_on_timeout_schema() -> None:
     print("\non_timeout")
     schema = next(t for t in ab.tool_schema() if t["name"] == "ask_parent")
@@ -265,6 +366,8 @@ if __name__ == "__main__":
     test_codex_overrides()
     test_escalation()
     test_supervision_notes()
+    test_delegation()
+    test_concerns()
     test_on_timeout_schema()
     test_transcript_parsers()
 

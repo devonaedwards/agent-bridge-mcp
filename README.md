@@ -27,6 +27,7 @@ sessions you can pick up yourself in a terminal.
 - `pending_questions` / `answer_agent` - **parent-side**: see and answer those questions.
 - `escalate_question` - **parent-side**: pass a question up when you can't answer it either.
 - `send_note` / `check_notes` - redirect a running subagent mid-flight.
+- `raise_concern` / `list_concerns` - subagents flag problems outside their task, without blocking.
 
 ## Watching a subagent (`peek_agent`)
 

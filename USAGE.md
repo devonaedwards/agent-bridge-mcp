@@ -80,6 +80,51 @@ a note redirecting phases 2-4, applied it to exactly those, and left phase 1 alo
 also noted in its report that it had *not* checked between phases 2 and 3 — so a note
 landing in that window would have arrived one phase late. That gap is inherent.
 
+## Concerns: see something, say something
+
+A subagent that notices something wrong *outside* its assigned task - a bug in code it
+was only reading past, a security risk, a mistaken premise, a helper's output it doesn't
+trust - can flag it with `raise_concern`. It does not block; the agent keeps working.
+
+```
+list_concerns(min_severity="critical")   -> what subagents flagged unprompted
+```
+
+`agent_status` also surfaces a job's concerns inline, with a `critical_concerns` warning.
+Check them before accepting a job's output: by definition these are things nobody asked
+about, so they will not appear in the result unless the agent also volunteered them.
+
+Observed working: an agent given a purely mechanical task (count the lines in a file)
+did exactly that, and also flagged a `shutil.rmtree("/")` buried in the file as critical,
+with the file and line - having only read the file in order to count it.
+
+The distinction from `ask_parent` matters: a question blocks because the agent needs an
+answer to continue. A concern does not. An agent that cannot safely proceed should ask,
+with `on_timeout="abort"`.
+
+## Delegating drudgery to a cheaper model
+
+A subagent can hand its own toil to a cheaper model - bulk mechanical edits, log
+scanning, reformatting - by launching helpers of its own:
+
+- It may only delegate **downward**: strictly lower on the capability ladder than the
+  model it is running. Upward or sideways is refused, so the affordance can't route real
+  work back to a frontier model.
+- It must **name the model** explicitly; an unnamed or unknown model is refused.
+- At most **2 helpers** per subagent (`AGENT_BRIDGE_MAX_HELPERS` to change).
+- Top-level launches (yours) are unrestricted - the limits apply only to subagents.
+
+The delegating agent stays responsible for the result, including anything a helper got
+wrong, and is told so.
+
+Ladders, most capable first. Codex's is read from `~/.codex/models_cache.json`, which
+already lists models in descending capability, so it tracks the lineup automatically:
+
+```
+claude: fable-5 > opus-4-8 > opus-4-7 > opus-4-6 > sonnet-5 > sonnet-4-6 > haiku-4-5
+codex:  gpt-5.6-sol > gpt-5.6-terra > gpt-5.6-luna > gpt-5.5 > gpt-5.4 > gpt-5.4-mini
+```
+
 ## Continue a finished agent
 
 Both kinds keep their sessions, so a finished job can be picked back up:

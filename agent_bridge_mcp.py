@@ -63,6 +63,8 @@ ASK_PARENT_TOOL = f"mcp__{BRIDGE_MCP_NAME}__ask_parent"
 CODEX_ASK_PARENT_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__ask_parent"
 CHECK_NOTES_TOOL = f"mcp__{BRIDGE_MCP_NAME}__check_notes"
 CODEX_CHECK_NOTES_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__check_notes"
+RAISE_CONCERN_TOOL = f"mcp__{BRIDGE_MCP_NAME}__raise_concern"
+CODEX_RAISE_CONCERN_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__raise_concern"
 
 ASK_PARENT_PREAMBLE = (
     "You are running as a background subagent, and the parent agent that launched you is "
@@ -88,6 +90,21 @@ ASK_PARENT_PREAMBLE = (
     "cheap and returns immediately when there is nothing waiting. Do NOT poll it in a "
     "loop or between every small step - checking constantly wastes your turns without "
     "learning anything.\n"
+    "You do not have to do all your own drudgery. You may launch up to {max_helpers} helper "
+    "agent(s) of your own on a CHEAPER model than the one you are running, for the toil in "
+    "your task - bulk mechanical edits, scanning long logs, reformatting, repetitive lookups. "
+    "Name the model explicitly when you do; you can only delegate downward, never to an equal "
+    "or better model. Keep the judgement, the design decisions, and the final report for "
+    "yourself: you remain fully responsible for the work, including anything a helper got "
+    "wrong, so check what comes back rather than passing it through unread. Delegating is a "
+    "way to spend your attention where it matters, not a way to hand off accountability.\n"
+    "If you notice something wrong that is OUTSIDE what you were asked to do - a bug in code "
+    "you were only reading past, a security or data-loss risk, a premise in your instructions "
+    "you believe is mistaken, or output from one of your own helpers you do not trust - say so "
+    "with `{concern_tool}`. It records the observation and does NOT block you; keep working. "
+    "Noticing is not off-task, and 'nobody asked me' is not a reason to stay quiet - you may "
+    "be the only one positioned to see it. Raise it as 'critical' only when acting on it "
+    "matters more than finishing your task.\n"
     "You are entitled to enough context to make good decisions. If you were handed a task "
     "without the purpose behind it, without knowing what your output feeds into, or without "
     "the judgement calls you're allowed to make on your own, that lack IS worth asking about - "
@@ -103,7 +120,7 @@ BRIDGE_SCRIPT = str(Path(__file__).resolve())
 CODEX_BRIDGE_TOOL_TIMEOUT_SEC = 3600
 
 
-def codex_bridge_overrides(job_id: str) -> list[str]:
+def codex_bridge_overrides(job_id: str, model: str | None = None) -> list[str]:
     """`-c` flags that register THIS server into a codex subagent, so it can ask_parent.
 
     Codex only sees MCP servers declared in config.toml, and this repo's may not be there.
@@ -132,6 +149,7 @@ def codex_bridge_overrides(job_id: str) -> list[str]:
         'AGENT_BRIDGE_PARENT="codex"',
         f'AGENT_BRIDGE_MAX_DEPTH="{max_depth()}"',
         f'AGENT_BRIDGE_ANCESTRY="{",".join(ancestry)}"',
+        *([f'AGENT_BRIDGE_MODEL="{model}"'] if model else []),
     ])
     # Inject under the SAME key config.toml uses (hyphenated). Codex merges -c overrides
     # into a matching entry but treats a different key as a SECOND server - and since it
@@ -175,9 +193,12 @@ def codex_has_bridge() -> bool:
 
 
 def with_ask_parent_preamble(prompt: str, tool_name: str = ASK_PARENT_TOOL,
-                             notes_tool: str = CHECK_NOTES_TOOL) -> str:
+                             notes_tool: str = CHECK_NOTES_TOOL,
+                             concern_tool: str = RAISE_CONCERN_TOOL) -> str:
     """Advertise the parent question and note channels. Background launches only."""
-    preamble = ASK_PARENT_PREAMBLE.format(tool=tool_name, notes_tool=notes_tool)
+    preamble = ASK_PARENT_PREAMBLE.format(
+        tool=tool_name, notes_tool=notes_tool, max_helpers=max_helpers(),
+        concern_tool=concern_tool)
     if preamble.strip() in prompt:
         return prompt
     return preamble + prompt
@@ -325,7 +346,7 @@ def resolve_cwd(args: dict[str, Any]) -> str:
     return cwd
 
 
-def child_env(kind: str, job_id: str | None = None) -> dict[str, str]:
+def child_env(kind: str, job_id: str | None = None, model: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     depth = current_depth()
     env["AGENT_BRIDGE_DEPTH"] = str(depth + 1)
@@ -345,6 +366,11 @@ def child_env(kind: str, job_id: str | None = None) -> dict[str, str]:
         env["AGENT_BRIDGE_JOB_ID"] = job_id
     else:
         env.pop("AGENT_BRIDGE_JOB_ID", None)
+    # The child needs its own model to know which tiers are BELOW it when delegating.
+    if model:
+        env["AGENT_BRIDGE_MODEL"] = model
+    else:
+        env.pop("AGENT_BRIDGE_MODEL", None)
     return env
 
 
@@ -508,6 +534,103 @@ def ask_parent(args: dict[str, Any]) -> dict[str, Any]:
         f"in your final report.",
         {"question_id": question_id, "status": "timeout", "on_timeout": "proceed"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Concerns: see something, say something.
+#
+# Distinct from ask_parent. A question BLOCKS because the agent needs an answer to
+# proceed. A concern does not block - the agent noticed something outside its
+# assigned task (a bug in code it was only passing through, a security problem, a
+# premise it believes is wrong, a helper's output it doesn't trust) and keeps
+# working. Without a channel, that observation lands in a final report nobody
+# re-reads, or is dropped as "not my task".
+# ---------------------------------------------------------------------------
+
+CONCERNS_DIR = STATE_DIR / "concerns"
+
+
+def _concerns_dir() -> Path:
+    CONCERNS_DIR.mkdir(parents=True, exist_ok=True)
+    return CONCERNS_DIR
+
+
+def _iter_concerns() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        for path in sorted(_concerns_dir().glob("*.json")):
+            try:
+                out.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                continue
+    except OSError:
+        return out
+    return out
+
+
+def concerns_for(job_id: str) -> list[dict[str, Any]]:
+    return [c for c in _iter_concerns() if c.get("job_id") == job_id]
+
+
+def raise_concern(args: dict[str, Any]) -> dict[str, Any]:
+    """Subagent-side: flag something worth knowing WITHOUT blocking on a reply."""
+    concern = require_str(args, "concern")
+    severity = enum_value(args, "severity", "warning", {"info", "warning", "critical"})
+    evidence = optional_str(args, "evidence") or ""
+    job_id = os.environ.get("AGENT_BRIDGE_JOB_ID")
+    if not job_id:
+        raise ValueError(
+            "raise_concern is only available to a background-launched subagent "
+            "(launch_claude_agent / launch_codex_agent)."
+        )
+    concern_id = str(uuid.uuid4())
+    record = {
+        "concern_id": concern_id,
+        "job_id": job_id,
+        "from_kind": os.environ.get("AGENT_BRIDGE_PARENT", "unknown"),
+        "from_model": os.environ.get("AGENT_BRIDGE_MODEL"),
+        "concern": concern,
+        "evidence": evidence,
+        "severity": severity,
+        "raised_at": time.time(),
+        "ancestry": [j for j in (os.environ.get("AGENT_BRIDGE_ANCESTRY") or "").split(",") if j],
+    }
+    target = _concerns_dir() / f"{concern_id}.json"
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, target)
+    log(f"concern [{severity}] from job {job_id}: {concern[:80]}")
+    return tool_response({
+        "concern_id": concern_id,
+        "severity": severity,
+        "recorded": True,
+        "note": (
+            "Recorded and surfaced to your parent - you are NOT blocked, carry on with your "
+            "task. Mention it in your final report too. If you cannot safely continue until "
+            "someone responds, that is a question, not a concern: use ask_parent with "
+            "on_timeout='abort' instead."
+        ),
+    })
+
+
+def list_concerns(args: dict[str, Any]) -> dict[str, Any]:
+    """Parent-side: read concerns raised by subagents."""
+    job_id = optional_str(args, "job_id")
+    min_severity = enum_value(args, "min_severity", "info", {"info", "warning", "critical"})
+    order = {"info": 0, "warning": 1, "critical": 2}
+    out = []
+    for c in _iter_concerns():
+        if job_id and c.get("job_id") != job_id:
+            continue
+        if order.get(c.get("severity", "info"), 0) < order[min_severity]:
+            continue
+        out.append(c)
+    out.sort(key=lambda c: (-order.get(c.get("severity", "info"), 0), c.get("raised_at") or 0))
+    return tool_response({
+        "concerns": out,
+        "count": len(out),
+        "critical_count": sum(1 for c in out if c.get("severity") == "critical"),
+    })
 
 
 def pending_questions(args: dict[str, Any]) -> dict[str, Any]:
@@ -719,6 +842,129 @@ def check_notes(args: dict[str, Any]) -> dict[str, Any]:
     })
 
 
+# ---------------------------------------------------------------------------
+# Delegation: a subagent may hand its own drudgery to a CHEAPER model.
+#
+# A depth-limited subagent would otherwise have to do all its own toil while
+# everything above it delegates freely. It can now launch helpers of its own -
+# but only at a strictly lower capability tier, and only a couple - so the
+# affordance can't be used to route real work back up to a frontier model or to
+# fan out without bound. The delegating agent stays accountable for the result.
+# ---------------------------------------------------------------------------
+
+# Most capable first. Claude's ladder is static (see the claude-api skill for the
+# current lineup); codex's is read from its own cache, which already lists models
+# in descending capability, so it doesn't rot when the lineup changes.
+CLAUDE_MODEL_TIERS = [
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+]
+CODEX_MODEL_TIERS_FALLBACK = [
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+]
+DEFAULT_MAX_HELPERS = 2
+
+_helpers_launched = 0
+_helpers_lock = threading.Lock()
+
+
+def codex_model_tiers() -> list[str]:
+    """Codex's own model cache, which lists models most-capable-first."""
+    cache = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "models_cache.json"
+    try:
+        models = (json.loads(cache.read_text(encoding="utf-8")) or {}).get("models") or []
+        slugs = [m["slug"] for m in models if isinstance(m, dict) and m.get("slug")]
+        # Drop non-agent entries like codex-auto-review, which aren't a capability tier.
+        slugs = [s for s in slugs if not s.startswith("codex-")]
+        return slugs or CODEX_MODEL_TIERS_FALLBACK
+    except (OSError, json.JSONDecodeError, KeyError):
+        return CODEX_MODEL_TIERS_FALLBACK
+
+
+def _normalize_model(model: str) -> str:
+    """Strip context-window and date suffixes so aliases compare equal."""
+    model = model.strip().lower()
+    for suffix in ("[1m]", "[200k]"):
+        model = model.replace(suffix, "")
+    return model.strip()
+
+
+def model_rank(kind: str, model: str | None) -> int | None:
+    """Position in the capability ladder; lower is more capable. None if unknown."""
+    if not model:
+        return None
+    tiers = CLAUDE_MODEL_TIERS if kind == "claude" else codex_model_tiers()
+    target = _normalize_model(model)
+    for index, known in enumerate(tiers):
+        if target == known or target.startswith(known):
+            return index
+    return None
+
+
+def max_helpers() -> int:
+    try:
+        return max(0, int(os.environ.get("AGENT_BRIDGE_MAX_HELPERS", str(DEFAULT_MAX_HELPERS))))
+    except ValueError:
+        return DEFAULT_MAX_HELPERS
+
+
+def enforce_delegation(kind: str, requested_model: str | None) -> None:
+    """Gate a subagent launching its own helper. No-op for a top-level agent.
+
+    Top-level launches are the human's call and stay unrestricted. A subagent
+    (AGENT_BRIDGE_JOB_ID is set) may only delegate downward, and only a bounded
+    number of times.
+    """
+    if not os.environ.get("AGENT_BRIDGE_JOB_ID"):
+        return
+
+    with _helpers_lock:
+        already = _helpers_launched
+    allowed = max_helpers()
+    if already >= allowed:
+        raise RuntimeError(
+            f"delegation limit reached: you have already launched {already} helper agent(s), "
+            f"the maximum is {allowed}. Do the remaining work yourself, or ask your parent "
+            "(ask_parent) if the task genuinely needs more delegation than that."
+        )
+
+    own_model = os.environ.get("AGENT_BRIDGE_MODEL")
+    own_rank = model_rank(os.environ.get("AGENT_BRIDGE_PARENT", kind), own_model)
+    if not requested_model:
+        raise ValueError(
+            "as a subagent you must name the `model` you are delegating to, and it must be "
+            "less capable than your own. Delegate drudgery (mechanical edits, bulk reads, "
+            f"formatting, log scanning) to a cheaper model - for {kind} the cheaper tiers are "
+            f"{', '.join((CLAUDE_MODEL_TIERS if kind == 'claude' else codex_model_tiers())[-2:])}."
+        )
+    requested_rank = model_rank(kind, requested_model)
+    if requested_rank is None:
+        raise ValueError(
+            f"unknown model '{requested_model}' - cannot confirm it is a lower tier than "
+            "yours. Name a model from the known ladder: "
+            f"{', '.join(CLAUDE_MODEL_TIERS if kind == 'claude' else codex_model_tiers())}"
+        )
+    # Unknown own_rank means we can't prove the delegation goes downward. Allow it, since
+    # the count cap still bounds the blast radius, but say so in the log.
+    if own_rank is None:
+        log(f"delegation: own model {own_model!r} not on the ladder; tier check skipped")
+    elif requested_rank <= own_rank:
+        raise RuntimeError(
+            f"you may only delegate DOWNWARD. You are running {own_model}; "
+            f"'{requested_model}' is equal or more capable, so this would escalate rather "
+            "than offload. Pick a cheaper model for the drudgery, and keep the judgement "
+            "calls yourself - you remain responsible for the result either way."
+        )
+
+    with _helpers_lock:
+        globals()["_helpers_launched"] = already + 1
+
+
 def command_preview(command: list[str]) -> list[str]:
     preview = list(command)
     if preview and preview[-1] == "-":
@@ -735,8 +981,11 @@ def build_codex_command(
     # Advertise ask_parent only if codex can actually reach the bridge: either we're
     # injecting it for this invocation (job_id present), or it's in the user's config.
     inject_bridge = bool(background and job_id)
+    # Needed by the -c injection below, so resolve it before that block.
+    model = optional_str(args, "model")
     if background and (inject_bridge or codex_has_bridge()):
-        prompt = with_ask_parent_preamble(prompt, CODEX_ASK_PARENT_TOOL, CODEX_CHECK_NOTES_TOOL)
+        prompt = with_ask_parent_preamble(
+            prompt, CODEX_ASK_PARENT_TOOL, CODEX_CHECK_NOTES_TOOL, CODEX_RAISE_CONCERN_TOOL)
     cwd = resolve_cwd(args)
     timeout_seconds = optional_int(args, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1, 24 * 60 * 60)
     codex_bin = os.environ.get("CODEX_BIN", "codex")
@@ -772,9 +1021,8 @@ def build_codex_command(
         command.append("--skip-git-repo-check")
     if inject_bridge:
         assert job_id is not None
-        command.extend(codex_bridge_overrides(job_id))
+        command.extend(codex_bridge_overrides(job_id, model))
 
-    model = optional_str(args, "model")
     if model:
         command.extend(["--model", model])
 
@@ -822,7 +1070,7 @@ def build_claude_command(args: dict[str, Any], background: bool = False) -> tupl
     # subagent is told it can ask (via the preamble) and then blocked from doing so.
     # Add it back rather than let that contradiction ship.
     if background and allowed_tools:
-        for required in (ASK_PARENT_TOOL, CHECK_NOTES_TOOL):
+        for required in (ASK_PARENT_TOOL, CHECK_NOTES_TOOL, RAISE_CONCERN_TOOL):
             if required not in allowed_tools:
                 allowed_tools = [*allowed_tools, required]
     extra_args = optional_string_list(args, "extra_args")
@@ -920,6 +1168,7 @@ def git_commit_paths(cwd: str, paths: list[str], message: str) -> dict[str, Any]
 
 def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, commit_paths: list[str] | None = None, commit_message: str | None = None, meta: dict[str, Any] | None = None, job_id: str | None = None) -> dict[str, Any]:
     enforce_depth()
+    enforce_delegation(kind, (meta or {}).get("model"))
     # The job id reaches the child so ask_parent can address questions back at this job.
     # Callers that must bake it into the command itself (launch_codex, via -c env
     # overrides) generate it first and pass it in; otherwise make one here.
@@ -927,7 +1176,7 @@ def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, 
     process = subprocess.Popen(
         command,
         cwd=cwd,
-        env=child_env(kind, job_id=job_id),
+        env=child_env(kind, job_id=job_id, model=(meta or {}).get("model")),
         # DEVNULL (never None) when we aren't piping a prompt: None would make the child
         # INHERIT the server's stdin (the JSON-RPC pipe), and a subagent that reads stdin
         # (e.g. `claude --print`) then steals incoming requests, hanging agent_status.
@@ -1234,6 +1483,21 @@ def summarize_job(job: Job) -> dict[str, Any]:
 
     # A blocked subagent is stuck until someone answers, and nothing else in this payload
     # would reveal that - it just looks like a slow job. Surface it loudly.
+    raised = concerns_for(job.id)
+    if raised:
+        summary["concerns"] = [
+            {"severity": c["severity"], "concern": c["concern"],
+             "evidence": c.get("evidence") or None, "concern_id": c["concern_id"]}
+            for c in sorted(raised, key=lambda c: c.get("raised_at") or 0)
+        ]
+        critical = [c for c in raised if c.get("severity") == "critical"]
+        if critical:
+            summary["critical_concerns"] = (
+                f"{len(critical)} CRITICAL concern(s) raised by this subagent - it flagged "
+                "something it judged serious enough to report unprompted. Read them before "
+                "accepting this job's output."
+            )
+
     blocked = pending_questions_for(job.id)
     if blocked:
         summary["pending_questions"] = [
@@ -1309,6 +1573,7 @@ def enrich_sync_result(kind: str, result: dict[str, Any], meta: dict[str, Any]) 
 
 def run_codex(args: dict[str, Any]) -> dict[str, Any]:
     command, prompt, cwd, timeout_seconds, meta = build_codex_command(args)
+    enforce_delegation("codex", meta.get("model"))
     max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
     result = run_command("codex", command, prompt, cwd, timeout_seconds, max_output_chars)
     commit_paths = optional_string_list(args, "commit_paths")
@@ -1330,6 +1595,7 @@ def launch_codex(args: dict[str, Any]) -> dict[str, Any]:
 
 def run_claude(args: dict[str, Any]) -> dict[str, Any]:
     command, prompt, cwd, timeout_seconds, meta = build_claude_command(args)
+    enforce_delegation("claude", meta.get("model"))
     max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
     result = run_command("claude", command, None if command[-1] != "-" else prompt, cwd, timeout_seconds, max_output_chars)
     enrich_sync_result("claude", result, meta)
@@ -2343,6 +2609,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "pending_questions": pending_questions,
     "answer_agent": answer_agent,
     "escalate_question": escalate_question,
+    "raise_concern": raise_concern,
+    "list_concerns": list_concerns,
     "send_note": send_note,
     "check_notes": check_notes,
     "codex_usage": codex_usage,
@@ -2787,6 +3055,63 @@ def tool_schema() -> list[dict[str, Any]]:
                 "and not between every small step."
             ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "raise_concern",
+            "description": (
+                "SUBAGENT-ONLY. Flag something wrong that is OUTSIDE your assigned task, "
+                "without blocking. Use for a bug in code you were only reading past, a "
+                "security or data-loss risk, a premise in your instructions you believe is "
+                "mistaken, or output from your own helper you don't trust. Recording it does "
+                "NOT pause you - keep working and mention it in your final report too. If you "
+                "cannot safely proceed without a reply, that is a question: use ask_parent "
+                "with on_timeout='abort' instead."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "concern": {
+                        "type": "string",
+                        "description": "What is wrong and why it matters. Be specific enough to act on.",
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "File, line, command output, or quote that supports it.",
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["info", "warning", "critical"],
+                        "default": "warning",
+                        "description": (
+                            "'critical' means acting on this matters more than finishing your "
+                            "task - reserve it for that."
+                        ),
+                    },
+                },
+                "required": ["concern"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "list_concerns",
+            "description": (
+                "PARENT-SIDE. Read concerns subagents raised unprompted. These are things they "
+                "noticed outside their assigned task, so they will NOT appear in the job's "
+                "result unless the agent also mentioned them. agent_status surfaces a job's "
+                "concerns inline; use this to sweep across jobs or filter by severity."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "Optional: only this job's concerns."},
+                    "min_severity": {
+                        "type": "string",
+                        "enum": ["info", "warning", "critical"],
+                        "default": "info",
+                    },
+                },
+                "additionalProperties": False,
+            },
         },
         {
             "name": "escalate_question",
