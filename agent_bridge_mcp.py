@@ -72,7 +72,21 @@ ASK_PARENT_PREAMBLE = (
     "expected, not a failure; a wrong assumption carried to completion costs far more than a "
     "question. Do not use it for anything you can settle yourself by reading the repo. If no "
     "answer arrives before the timeout, proceed on your best judgement and state plainly in "
-    "your final report what you assumed and why.\n\n"
+    "your final report what you assumed and why.\n"
+    "If guessing wrong would be destructive, irreversible, or expensive to undo, pass "
+    "on_timeout='abort' - then an unanswered question stops that part of the work instead of "
+    "resolving into a guess. Prefer this over inventing a safe-looking default for something "
+    "the user would want to decide.\n"
+    "If you launch subagents of your own and one asks YOU something you have no basis to "
+    "answer, call `escalate_question` rather than making something up - a fabricated answer "
+    "from you is worse than its own guess, because it carries your authority.\n"
+    "You are entitled to enough context to make good decisions. If you were handed a task "
+    "without the purpose behind it, without knowing what your output feeds into, or without "
+    "the judgement calls you're allowed to make on your own, that lack IS worth asking about - "
+    "it is not a failing on your part to need it. Your report will be read by the agent that "
+    "launched you and may reach the human; write it for someone who wasn't watching. Say what "
+    "you are confident in, what you assumed, and what you could not determine, in your own "
+    "words rather than a template.\n\n"
 )
 
 
@@ -96,11 +110,20 @@ def codex_bridge_overrides(job_id: str) -> list[str]:
     Env is passed explicitly because codex does not forward the parent's environment to
     MCP servers wholesale, and ask_parent addresses its question by AGENT_BRIDGE_JOB_ID.
     """
+    # Codex does not forward the parent's environment to MCP servers, so every var the
+    # child's bridge needs must be listed here. Ancestry is easy to forget and fails
+    # quietly: questions still work, they just report depth=1 with an empty chain, so an
+    # escalated question looks top-level and cannot be routed.
+    ancestry = [j for j in (os.environ.get("AGENT_BRIDGE_ANCESTRY") or "").split(",") if j]
+    here = os.environ.get("AGENT_BRIDGE_JOB_ID")
+    if here:
+        ancestry.append(here)
     env_pairs = ", ".join([
         f'AGENT_BRIDGE_JOB_ID="{job_id}"',
         f'AGENT_BRIDGE_DEPTH="{current_depth() + 1}"',
         'AGENT_BRIDGE_PARENT="codex"',
         f'AGENT_BRIDGE_MAX_DEPTH="{max_depth()}"',
+        f'AGENT_BRIDGE_ANCESTRY="{",".join(ancestry)}"',
     ])
     name = CODEX_BRIDGE_MCP_NAME
     return [
@@ -292,6 +315,15 @@ def child_env(kind: str, job_id: str | None = None) -> dict[str, str]:
     depth = current_depth()
     env["AGENT_BRIDGE_DEPTH"] = str(depth + 1)
     env["AGENT_BRIDGE_PARENT"] = kind
+    # Record the launcher's own job id (empty at top level) BEFORE overwriting it, so a
+    # question carries the chain it came from. Without this an escalated question from a
+    # depth-2 agent is unroutable: you can see it, but not who is supposed to answer it.
+    ancestry = [j for j in (os.environ.get("AGENT_BRIDGE_ANCESTRY") or "").split(",") if j]
+    here = os.environ.get("AGENT_BRIDGE_JOB_ID")
+    if here:
+        ancestry.append(here)
+    env["AGENT_BRIDGE_ANCESTRY"] = ",".join(ancestry)
+
     # Only BACKGROUND jobs get a job id, and it is what gates ask_parent: a synchronous
     # run_* agent must not be able to block on a question its parent cannot answer.
     if job_id:
@@ -392,6 +424,10 @@ def ask_parent(args: dict[str, Any]) -> dict[str, Any]:
     question = require_str(args, "question")
     context = optional_str(args, "context") or ""
     timeout_seconds = optional_int(args, "timeout_seconds", 600, 5, 24 * 60 * 60)
+    # "proceed" means the question is advisory - guessing is acceptable if nobody answers.
+    # "abort" means it is load-bearing: for a destructive or irreversible step, silently
+    # picking an interpretation is worse than doing nothing at all.
+    on_timeout = enum_value(args, "on_timeout", "proceed", {"proceed", "abort"})
 
     job_id = os.environ.get("AGENT_BRIDGE_JOB_ID")
     if not job_id:
@@ -403,6 +439,7 @@ def ask_parent(args: dict[str, Any]) -> dict[str, Any]:
         )
 
     question_id = str(uuid.uuid4())
+    ancestry = [j for j in (os.environ.get("AGENT_BRIDGE_ANCESTRY") or "").split(",") if j]
     record = {
         "question_id": question_id,
         "job_id": job_id,
@@ -413,6 +450,13 @@ def ask_parent(args: dict[str, Any]) -> dict[str, Any]:
         "asked_at": time.time(),
         "answer": None,
         "answered_at": None,
+        "on_timeout": on_timeout,
+        # Chain of job ids from the top-level agent down to this one's launcher.
+        "ancestry": ancestry,
+        "depth": len(ancestry) + 1,
+        # Set by escalate_question when an intermediate parent cannot answer either.
+        "escalated": False,
+        "escalation_notes": [],
     }
     _write_question(record)
     log(f"question {question_id} from job {job_id}: {question[:80]}")
@@ -427,17 +471,27 @@ def ask_parent(args: dict[str, Any]) -> dict[str, Any]:
                     "question_id": question_id,
                     "status": "answered",
                     "answer": current.get("answer"),
+                    "escalated": current.get("escalated", False),
                     "waited_seconds": round(time.time() - record["asked_at"], 1),
                 }
             )
 
     record["status"] = "timeout"
     _write_question(record)
+    if on_timeout == "abort":
+        return tool_error(
+            f"NO ANSWER within {timeout_seconds}s, and you marked this question as "
+            "blocking (on_timeout='abort'). Do NOT guess. Stop work on the part of the "
+            "task that depends on this and report clearly: what you asked, that nobody "
+            "answered, and what remains undone. Complete any independent parts of the "
+            "task normally.",
+            {"question_id": question_id, "status": "timeout", "on_timeout": "abort"},
+        )
     return tool_error(
         f"no answer within {timeout_seconds}s - the parent may not have checked "
         f"pending_questions. Proceed using your best judgement and note the assumption "
         f"in your final report.",
-        {"question_id": question_id, "status": "timeout"},
+        {"question_id": question_id, "status": "timeout", "on_timeout": "proceed"},
     )
 
 
@@ -445,18 +499,83 @@ def pending_questions(args: dict[str, Any]) -> dict[str, Any]:
     """Parent-side: list questions subagents are currently blocked on."""
     job_id = optional_str(args, "job_id")
     include_answered = optional_bool(args, "include_answered", False)
+    escalated_only = optional_bool(args, "escalated_only", False)
     out = []
     for q in _iter_questions():
         if job_id and q.get("job_id") != job_id:
             continue
         if not include_answered and q.get("status") != "pending":
             continue
+        if escalated_only and not q.get("escalated"):
+            continue
         item = dict(q)
         if item.get("asked_at"):
             item["waiting_seconds"] = round(time.time() - item["asked_at"], 1)
         out.append(item)
-    out.sort(key=lambda q: q.get("asked_at") or 0)
-    return tool_response({"questions": out, "count": len(out)})
+    # Escalated questions first: they have already cost one agent its turn, and something
+    # above could not answer them, so they are the ones most likely to need a human.
+    out.sort(key=lambda q: (not q.get("escalated"), q.get("asked_at") or 0))
+    escalated = sum(1 for q in out if q.get("escalated"))
+    payload: dict[str, Any] = {"questions": out, "count": len(out)}
+    if escalated:
+        payload["escalated_count"] = escalated
+        payload["action_required"] = (
+            f"{escalated} question(s) were escalated - an intermediate agent could not "
+            "answer them. If you cannot either, ask the human rather than guessing."
+        )
+    return tool_response(payload)
+
+
+def escalate_question(args: dict[str, Any]) -> dict[str, Any]:
+    """Pass a subagent's question up the chain when you cannot answer it either.
+
+    The failure this exists to prevent: a mid-chain agent receives a question it has no
+    basis to answer, invents a plausible answer to avoid stalling, and the subagent acts
+    on it. That is strictly worse than the subagent guessing, because the fabricated
+    answer carries the authority of the parent. Escalating keeps the question alive and
+    marks it for whoever is actually in a position to decide - ultimately the human.
+    """
+    question_id = require_str(args, "question_id")
+    note = optional_str(args, "note") or ""
+    record = _read_question(question_id)
+    if record is None:
+        raise ValueError(f"unknown question_id: {question_id}")
+    if record.get("status") != "pending":
+        raise ValueError(
+            f"question {question_id} is {record.get('status')}, not pending - nothing to escalate"
+        )
+    record["escalated"] = True
+    notes = list(record.get("escalation_notes") or [])
+    notes.append({
+        "from_job": os.environ.get("AGENT_BRIDGE_JOB_ID") or "top-level",
+        "note": note,
+        "at": time.time(),
+    })
+    record["escalation_notes"] = notes
+    _write_question(record)
+    return tool_response({
+        "question_id": question_id,
+        "status": "pending",
+        "escalated": True,
+        # Learned the hard way: without this, an escalating agent waits for the answer to
+        # come back to IT, never sees one (the answer goes straight to the original asker),
+        # concludes the chain failed, and reports the eventually-correct result as
+        # fabricated. Escalation then makes the outcome worse than not escalating.
+        "do_not_relay": (
+            "You do NOT relay this answer and you must NOT call answer_agent for it. "
+            "Whoever answers unblocks the original subagent DIRECTLY - the answer will "
+            "never be handed back to you."
+        ),
+        "how_to_check": (
+            f"To see the resolution, call pending_questions(job_id='{record.get('job_id')}', "
+            "include_answered=true) and read the 'answer' field, or agent_status on that "
+            "job. Seeing no answer addressed to you is EXPECTED and does not mean the "
+            "chain failed - check before reporting failure."
+        ),
+        "question": record.get("question"),
+        "asked_by_job": record.get("job_id"),
+        "depth": record.get("depth"),
+    })
 
 
 def answer_agent(args: dict[str, Any]) -> dict[str, Any]:
@@ -2108,6 +2227,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "ask_parent": ask_parent,
     "pending_questions": pending_questions,
     "answer_agent": answer_agent,
+    "escalate_question": escalate_question,
     "codex_usage": codex_usage,
     "codex_status": codex_status,
     "claude_usage": claude_usage,
@@ -2119,7 +2239,18 @@ def tool_schema() -> list[dict[str, Any]]:
     prompt_schema = {
         "type": "object",
         "properties": {
-            "prompt": {"type": "string", "description": "Instructions for the subagent."},
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "Instructions for the subagent. Give it what you would want if you were the "
+                    "one receiving this task and could not see the rest of the conversation: "
+                    "the purpose behind the task, what its output feeds into, which judgement "
+                    "calls are its own to make, and any constraint that would be expensive to "
+                    "discover late. A subagent with context produces better work and asks "
+                    "better questions; one handed a decontextualized fragment has to guess at "
+                    "what you meant, and will usually guess plausibly and wrongly."
+                ),
+            },
             "cwd": {
                 "type": "string",
                 "description": "Working directory for the subagent. Defaults to the MCP server cwd.",
@@ -2453,12 +2584,23 @@ def tool_schema() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "Optional: what you've already established, so the parent can answer without re-deriving it.",
                     },
+                    "on_timeout": {
+                        "type": "string",
+                        "enum": ["proceed", "abort"],
+                        "default": "proceed",
+                        "description": (
+                            "What to do if nobody answers. 'proceed' (default) = advisory, guess "
+                            "and flag the assumption. 'abort' = the answer is load-bearing; stop "
+                            "that part of the task rather than guess. Use 'abort' when guessing "
+                            "wrong would be destructive, irreversible, or expensive to undo."
+                        ),
+                    },
                     "timeout_seconds": {
                         "type": "integer",
                         "minimum": 5,
                         "maximum": 86400,
                         "default": 600,
-                        "description": "How long to wait before giving up and proceeding on your own judgement.",
+                        "description": "How long to wait before on_timeout applies.",
                     },
                 },
                 "required": ["question"],
@@ -2482,7 +2624,38 @@ def tool_schema() -> list[dict[str, Any]]:
                         "default": False,
                         "description": "Include already-answered and timed-out questions.",
                     },
+                    "escalated_only": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Only questions an intermediate agent could not answer.",
+                    },
                 },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "escalate_question",
+            "description": (
+                "PARENT-SIDE. Pass a subagent's question UP the chain when you cannot answer "
+                "it either. Use this instead of inventing a plausible answer: a fabricated "
+                "answer is worse than the subagent's own guess, because it carries your "
+                "authority. Escalating does NOT answer the question and does NOT hand it back "
+                "to you - whoever answers unblocks the original subagent directly, so never "
+                "call answer_agent for a question you escalated. Check the outcome with "
+                "pending_questions(include_answered=true); seeing no answer addressed to you "
+                "is expected, not a failure. If you are the TOP-LEVEL agent facing an escalated "
+                "question, put it to the human and relay their reply with answer_agent."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question_id": {"type": "string", "description": "From pending_questions / agent_status."},
+                    "note": {
+                        "type": "string",
+                        "description": "Why you can't answer, and anything you ruled out. Saves the next agent repeating it.",
+                    },
+                },
+                "required": ["question_id"],
                 "additionalProperties": False,
             },
         },

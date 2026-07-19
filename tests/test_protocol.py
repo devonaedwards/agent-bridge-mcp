@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -122,6 +123,59 @@ def test_codex_overrides() -> None:
     check("tool timeout exceeds ask_parent default", ab.CODEX_BRIDGE_TOOL_TIMEOUT_SEC > 600)
     check("job id is passed through env", "JOB-1" in joined)
     check("args value is TOML not JSON", '.args=["' in joined)
+    # Codex forwards no parent env, so anything the child's bridge needs must be listed.
+    # A missing ancestry fails quietly: escalated questions report depth=1 and can't route.
+    check("ancestry forwarded through -c env", "AGENT_BRIDGE_ANCESTRY" in joined)
+
+
+def test_escalation() -> None:
+    print("\nescalation")
+    import os
+    os.environ["AGENT_BRIDGE_JOB_ID"] = "JOB-CHILD"
+    os.environ.pop("AGENT_BRIDGE_ANCESTRY", None)
+    try:
+        record = {
+            "question_id": "Q-ESC", "job_id": "JOB-CHILD", "question": "which one?",
+            "context": "", "status": "pending", "asked_at": time.time(), "answer": None,
+            "answered_at": None, "on_timeout": "proceed", "ancestry": ["JOB-TOP"],
+            "depth": 2, "escalated": False, "escalation_notes": [],
+        }
+        ab._write_question(record)
+
+        payload = json.loads(ab.escalate_question(
+            {"question_id": "Q-ESC", "note": "no basis to answer"})["content"][0]["text"])
+        check("marks escalated", payload["escalated"] is True)
+        check("question stays pending", payload["status"] == "pending")
+        # The flaw a live run exposed: an escalating agent waited for the answer to come
+        # back to it, saw none, and reported the correct result as fabricated.
+        check("tells escalator NOT to relay", "do_not_relay" in payload)
+        check("tells escalator how to check", "pending_questions" in payload.get("how_to_check", ""))
+
+        stored = ab._read_question("Q-ESC")
+        check("note recorded with provenance", stored["escalation_notes"][0]["from_job"] == "JOB-CHILD")
+
+        listed = json.loads(ab.pending_questions({"escalated_only": True})["content"][0]["text"])
+        check("escalated_only filter works", any(q["question_id"] == "Q-ESC" for q in listed["questions"]))
+        check("escalation raises action_required", "action_required" in listed)
+
+        try:
+            ab.escalate_question({"question_id": "Q-NOPE", "note": ""})
+            check("escalate rejects unknown id", False, "no exception")
+        except ValueError:
+            check("escalate rejects unknown id", True)
+    finally:
+        os.environ.pop("AGENT_BRIDGE_JOB_ID", None)
+        (ab.QUESTIONS_DIR / "Q-ESC.json").unlink(missing_ok=True)
+
+
+def test_on_timeout_schema() -> None:
+    print("\non_timeout")
+    schema = next(t for t in ab.tool_schema() if t["name"] == "ask_parent")
+    prop = schema["inputSchema"]["properties"].get("on_timeout", {})
+    check("on_timeout exposed", set(prop.get("enum", [])) == {"proceed", "abort"})
+    check("defaults to proceed", prop.get("default") == "proceed")
+    check("preamble teaches abort", "abort" in ab.ASK_PARENT_PREAMBLE)
+    check("preamble teaches escalation", "escalate_question" in ab.ASK_PARENT_PREAMBLE)
 
 
 def test_transcript_parsers() -> None:
@@ -156,6 +210,8 @@ if __name__ == "__main__":
     test_ask_parent_guards()
     test_preamble_gating()
     test_codex_overrides()
+    test_escalation()
+    test_on_timeout_schema()
     test_transcript_parsers()
 
     print()
