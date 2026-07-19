@@ -3,6 +3,14 @@
 Local stdio MCP server that lets Claude Code launch Codex subagents and lets
 Codex launch Claude Code subagents.
 
+Subagents can be watched while they work (`peek_agent`), can ask the launching
+agent questions and block on the answer (`ask_parent`), and leave resumable
+sessions you can pick up yourself in a terminal.
+
+- [USAGE.md](USAGE.md) - recipes for driving subagents
+- [DEVELOPMENT.md](DEVELOPMENT.md) - architecture, testing, and the gotchas
+- `python3 tests/test_protocol.py` - fast checks, no tokens spent
+
 ## Tools
 
 - `run_codex_agent` - run `codex exec` and wait for completion.
