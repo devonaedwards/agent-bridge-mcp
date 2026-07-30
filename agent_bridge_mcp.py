@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 
 SERVER_NAME = "agent-bridge-mcp"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.5.0-grok-kimi-opencode"
 
 DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_MAX_OUTPUT_CHARS = 30000
@@ -65,6 +65,50 @@ CHECK_NOTES_TOOL = f"mcp__{BRIDGE_MCP_NAME}__check_notes"
 CODEX_CHECK_NOTES_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__check_notes"
 RAISE_CONCERN_TOOL = f"mcp__{BRIDGE_MCP_NAME}__raise_concern"
 CODEX_RAISE_CONCERN_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__raise_concern"
+# The child's channel back to whoever launched it: ask a blocking question, pick up
+# a mid-flight note, flag something wrong. These are ALWAYS permitted, never gated
+# on a caller's allowlist - see always_allowed_report_tools().
+REPORT_CHANNEL_TOOLS = (ASK_PARENT_TOOL, CHECK_NOTES_TOOL, RAISE_CONCERN_TOOL)
+# Where a subagent looks before spending tokens on a fresh helper.
+WARM_AGENTS_TOOL = f"mcp__{BRIDGE_MCP_NAME}__warm_agents"
+CODEX_WARM_AGENTS_TOOL = f"mcp__{CODEX_BRIDGE_MCP_NAME}__warm_agents"
+KIMI_WARM_AGENTS_TOOL = WARM_AGENTS_TOOL
+OPENCODE_WARM_AGENTS_TOOL = "warm_agents"
+GROK_WARM_AGENTS_TOOL = "warm_agents"
+# Opencode exposes MCP tools directly without mcp__ prefix (observed: `ask_parent` not `mcp__agent-bridge__ask_parent`)
+OPENCODE_ASK_PARENT_TOOL = "ask_parent"
+OPENCODE_CHECK_NOTES_TOOL = "check_notes"
+OPENCODE_RAISE_CONCERN_TOOL = "raise_concern"
+# Kimi Code uses mcp__<server>__<tool> similar to Claude (preserves hyphen)
+KIMI_ASK_PARENT_TOOL = f"mcp__{BRIDGE_MCP_NAME}__ask_parent"
+KIMI_CHECK_NOTES_TOOL = f"mcp__{BRIDGE_MCP_NAME}__check_notes"
+KIMI_RAISE_CONCERN_TOOL = f"mcp__{BRIDGE_MCP_NAME}__raise_concern"
+# Grok: docs say permissions use MCPTool(server__tool) without mcp__ prefix, but actual tool names discovered
+# are direct like run_codex_agent (from logs: tools list shows direct names, no server prefix)
+# However grok doctor says tool_count 28 with direct names. So use direct names like opencode.
+# But per docs, MCPTool pattern is server__tool, not mcp__server__tool. Let's use direct for preamble
+# to be safe, and also define both forms as fallback.
+GROK_ASK_PARENT_TOOL = "ask_parent"
+GROK_CHECK_NOTES_TOOL = "check_notes"
+GROK_RAISE_CONCERN_TOOL = "raise_concern"
+# Alternative with server prefix if needed
+GROK_ASK_PARENT_TOOL_ALT = f"{BRIDGE_MCP_NAME}__ask_parent"
+GROK_ASK_PARENT_TOOL_MCP = f"mcp__{BRIDGE_MCP_NAME}__ask_parent"
+# Same guarantee as always_allowed_report_tools() gives claude, spelled for grok's
+# `--allow <RULE>` flag. Because grok's tool naming is still unsettled (see above),
+# every plausible form is allowed rather than betting on one: grok accepts unmatched
+# rules without erroring (verified against the installed CLI), so the redundant
+# entries cost nothing and the child keeps its channel home whichever form is live.
+GROK_REPORT_CHANNEL_ALLOW_RULES = tuple(
+    rule
+    for tool in ("ask_parent", "check_notes", "raise_concern")
+    for rule in (
+        tool,
+        f"{BRIDGE_MCP_NAME}__{tool}",
+        f"mcp__{BRIDGE_MCP_NAME}__{tool}",
+        f"MCPTool({BRIDGE_MCP_NAME}__{tool})",
+    )
+)
 
 # The preamble is assembled from sections rather than sent whole. Every section here
 # earned its place from an observed failure, but sending all of them on every launch
@@ -104,13 +148,30 @@ PREAMBLE_SECTIONS: dict[str, str] = {
     ),
     "delegate": (
         "You do not have to do all your own drudgery. You may launch up to {max_helpers} helper "
-        "agent(s) of your own on a CHEAPER model than the one you are running, for the toil in "
-        "your task - bulk mechanical edits, scanning long logs, reformatting, repetitive lookups. "
-        "Name the model explicitly when you do; you can only delegate downward, never to an equal "
-        "or better model. Keep the judgement, the design decisions, and the final report for "
-        "yourself: you remain fully responsible for the work, including anything a helper got "
-        "wrong, so check what comes back rather than passing it through unread. Delegating is a "
-        "way to spend your attention where it matters, not a way to hand off accountability.\n"
+        "agent(s) of your own, and you must name the `model` explicitly when you do. Two "
+        "directions are open to you. DOWNWARD, to a cheaper model, for the toil in your task - "
+        "bulk mechanical edits, scanning long logs, reformatting, repetitive lookups. SIDEWAYS, "
+        "to a peer at your own capability level - usually a different vendor's frontier model, "
+        "such as Codex/Sol and Claude/Opus, which are peers of each other in both directions - "
+        "when a genuinely independent look is worth more than another pass of your own: a second "
+        "opinion on a design call, an adversarial read of a conclusion you are not sure of, or a "
+        "check on work where your own blind spot is the risk. What you may NOT do is delegate "
+        "upward to a more capable class than your own; that is escalation wearing the costume of "
+        "offloading, and `escalate_question`/`ask_parent` is the honest way to do it. Keep the "
+        "judgement, the design decisions, and the final report for yourself: you remain fully "
+        "responsible for the work, including anything a helper got wrong, so check what comes "
+        "back rather than passing it through unread - a peer's disagreement is evidence to weigh, "
+        "not a verdict that overrides you. Delegating is a way to spend your attention where it "
+        "matters, not a way to hand off accountability.\n"
+        "Before launching anything fresh, call `{warm_tool}`. If an agent has already worked "
+        "this problem it holds context you would otherwise pay to rebuild - the files it read, "
+        "the layout it learned, the corrections it absorbed - and resuming it with "
+        "`continue_*_agent` costs one turn instead of an entire re-education. Reuse the one "
+        "whose task line and directory match yours, and re-brief rather than assume when the "
+        "entry says 'stale' or 'crowded'. This has a limit: an agent carrying a lot of context, "
+        "or pointed at a different problem than yours, is worse than a fresh one, because its "
+        "old framing comes along with it. Warm and relevant beats fresh; warm and irrelevant "
+        "does not.\n"
     ),
     # Useless on a one-shot task: there is no phase boundary at which to check.
     "notes": (
@@ -263,9 +324,77 @@ def codex_has_bridge() -> bool:
     return "mcp_servers" in text and "agent_bridge_mcp.py" in text
 
 
+def opencode_has_bridge() -> bool:
+    """Is agent-bridge registered for opencode?
+
+    Opencode stores MCP servers in ~/.config/opencode/opencode.json under mcp.
+    We check that file for agent-bridge. If it's there, opencode subagents will
+    see ask_parent etc. (opencode tool names are direct, not prefixed).
+    """
+    # Allow override via env
+    config_path = Path(os.environ.get("OPENCODE_CONFIG", "~/.config/opencode/opencode.json")).expanduser()
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        # cheap check - look for agent-bridge anywhere and mcp block
+        return "agent-bridge" in text and "agent_bridge_mcp.py" in text
+    except OSError:
+        return False
+
+
+def kimi_has_bridge() -> bool:
+    """Is agent-bridge registered for Kimi Code?
+
+    Kimi stores MCP servers in ~/.kimi-code/mcp.json under mcpServers (per docs).
+    """
+    config_path = Path(os.environ.get("KIMI_CODE_HOME", "~/.kimi-code")).expanduser() / "mcp.json"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        return "agent-bridge" in text and "agent_bridge_mcp.py" in text
+    except OSError:
+        return False
+
+
+def grok_has_bridge() -> bool:
+    """Is agent-bridge registered for Grok Code?
+
+    Grok stores MCP servers in ~/.grok/config.toml as [mcp_servers.agent-bridge]
+    plus inherits from ~/.claude.json. We check both.
+    """
+    # Check grok's own config.toml
+    grok_config = Path(os.environ.get("GROK_HOME", "~/.grok")).expanduser() / "config.toml"
+    try:
+        text = grok_config.read_text(encoding="utf-8")
+        if "agent-bridge" in text and "agent_bridge_mcp.py" in text:
+            return True
+    except OSError:
+        pass
+    # Check claude.json inheritance (grok reads it)
+    claude_config = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / ".claude.json"
+    # Actually Claude stores in ~/.claude.json, not in CLAUDE_CONFIG_DIR? Try both
+    for p in [
+        Path("~/.claude.json").expanduser(),
+        Path("~/.claude/projects").expanduser().parent / ".." / ".claude.json",  # fallback
+    ]:
+        try:
+            text = p.read_text(encoding="utf-8")
+            if "agent-bridge" in text and "agent_bridge_mcp.py" in text:
+                return True
+        except OSError:
+            continue
+    # Also check ~/.claude.json directly via env
+    try:
+        text = Path(os.environ.get("CLAUDE_CONFIG", "~/.claude.json")).expanduser().read_text(encoding="utf-8")
+        if "agent-bridge" in text and "agent_bridge_mcp.py" in text:
+            return True
+    except OSError:
+        return False
+    return False
+
+
 def with_ask_parent_preamble(prompt: str, tool_name: str = ASK_PARENT_TOOL,
                              notes_tool: str = CHECK_NOTES_TOOL,
                              concern_tool: str = RAISE_CONCERN_TOOL,
+                             warm_tool: str = WARM_AGENTS_TOOL,
                              sections: list[str] | None = None,
                              multi_phase: bool = True) -> str:
     """Advertise the parent channels. Background launches only, gated by section."""
@@ -273,7 +402,7 @@ def with_ask_parent_preamble(prompt: str, tool_name: str = ASK_PARENT_TOOL,
     preamble = "".join(
         PREAMBLE_SECTIONS[name].format(
             tool=tool_name, notes_tool=notes_tool, max_helpers=max_helpers(),
-            concern_tool=concern_tool)
+            concern_tool=concern_tool, warm_tool=warm_tool)
         for name in chosen
     ) + "\n"
     if preamble.strip() in prompt:
@@ -296,7 +425,9 @@ class Job:
     cwd: str
     timeout_seconds: int
     started_at: float
-    process: subprocess.Popen[str]
+    # None for a job rehydrated from the on-disk roster after a server restart: the
+    # process is long gone, but its SESSION still exists and is what continue_* needs.
+    process: subprocess.Popen[str] | None = None
     stdout: str = ""
     stderr: str = ""
     returncode: int | None = None
@@ -312,6 +443,13 @@ class Job:
     resume: dict[str, Any] | None = None    # config needed to resume this job's session
     enriched: bool = False                 # token/session enrichment already attempted
     transcript_path: str | None = None     # cached live transcript/rollout, for peek_agent
+    # Reuse bookkeeping: what this agent was put to work on, and how warm it is.
+    task: str | None = None                # opening prompt, so a warm agent is identifiable
+    turns: int = 1                         # 1 at launch, +1 per continue_*
+    last_used_at: float | None = None      # last launch or continue, for staleness
+    retired: bool = False                  # human said stop reusing this one
+    retired_reason: str | None = None
+    rehydrated: bool = False               # came back from the roster, not this process
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
@@ -920,13 +1058,18 @@ def check_notes(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Delegation: a subagent may hand its own drudgery to a CHEAPER model.
+# Delegation: a subagent may hand work to a model at its own level or below.
 #
 # A depth-limited subagent would otherwise have to do all its own toil while
-# everything above it delegates freely. It can now launch helpers of its own -
-# but only at a strictly lower capability tier, and only a couple - so the
-# affordance can't be used to route real work back up to a frontier model or to
-# fan out without bound. The delegating agent stays accountable for the result.
+# everything above it delegates freely. It can launch helpers of its own - at an
+# equal or lower capability class, and only a couple - so the affordance can't be
+# used to route real work UP to a better model or to fan out without bound. The
+# delegating agent stays accountable for the result either way.
+#
+# Sideways delegation (equal class, usually a different vendor) is deliberately
+# allowed: a second opinion from a peer is the whole point of a bridge between
+# frontier models, and "Sol reviews what Opus wrote" is not an escalation. It is
+# what PEER_MODELS below exists to guarantee.
 # ---------------------------------------------------------------------------
 
 # Most capable first. Claude's ladder is static (see the claude-api skill for the
@@ -934,6 +1077,8 @@ def check_notes(args: dict[str, Any]) -> dict[str, Any]:
 # in descending capability, so it doesn't rot when the lineup changes.
 CLAUDE_MODEL_TIERS = [
     "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
@@ -944,7 +1089,146 @@ CLAUDE_MODEL_TIERS = [
 CODEX_MODEL_TIERS_FALLBACK = [
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 ]
+# Opencode can run many providers; we order by known capability - meta's spark at top,
+# then heavier opencode models, then free lightweight ones. Unknown models still work
+# because enforce_delegation allows unknown own_rank but checks requested.
+OPENCODE_MODEL_TIERS = [
+    "meta/muse-spark-1.1",
+    "opencode/big-pickle",
+    "anthropic/claude-opus-4",
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-5",
+    "openai/gpt-4.1",
+    "opencode/deepseek-v4-flash-free",
+    "opencode/laguna-s-2.1-free",
+    "opencode/ling-3.0-flash-free",
+    "opencode/mimo-v2.5-free",
+    "opencode/nemotron-3-ultra-free",
+    "opencode/north-mini-code-free",
+    "anthropic/claude-haiku-4",
+]
+# Kimi Code models (k3 is flagship, then k2.5, kimi-for-coding family, etc)
+KIMI_MODEL_TIERS = [
+    "kimi-code/k3",
+    "kimi-code/kimi-for-coding",
+    "kimi-code/kimi-for-coding-highspeed",
+    "kimi-code/kimi-k2.5",
+    "kimi/k2",
+    "kimi/k2-thinking",
+    "moonshot/kimi-k2",
+    "anthropic/claude-opus-4",
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-5",
+    "openai/gpt-4.1",
+    "anthropic/claude-haiku-4",
+]
+# Grok models (grok-4.5 flagship, plus older)
+GROK_MODEL_TIERS = [
+    "grok-4.5",
+    "grok-4.5-build-free",
+    "grok-4",
+    "grok-3",
+    "grok-3-mini",
+    "anthropic/claude-opus-4",
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-5",
+    "openai/gpt-4.1",
+    "anthropic/claude-haiku-4",
+]
 DEFAULT_MAX_HELPERS = 2
+
+# ---------------------------------------------------------------------------
+# Cross-vendor capability classes, most capable first.
+#
+# Delegation compares CLASSES, not ladder positions. Two ladders' indices are not
+# commensurable - index 0 of the codex ladder is not "the same capability as"
+# index 0 of opencode's - so the old rank<=rank check silently blocked every
+# cross-vendor peer handoff (claude-opus rank 3 vs gpt-5.6-sol rank 0 reads as an
+# escalation) while waving through nonsense in the other direction. Classes are
+# coarse on purpose: the question is only "is this an equal or a lesser model",
+# which is all the delegation rule needs to decide.
+# ---------------------------------------------------------------------------
+CAPABILITY_CLASSES = ["apex", "frontier", "workhorse", "light"]
+CAPABILITY_CLASS_MEMBERS: dict[str, list[str]] = {
+    # Priced and positioned above the frontier tier - not a peer of it.
+    "apex": [
+        "claude-fable-5",
+        "claude-mythos-5",
+    ],
+    # Each vendor's flagship. These are peers of each other; see PEER_MODELS.
+    "frontier": [
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "anthropic/claude-opus-4",
+        "gpt-5.6-sol",
+        "gpt-5.5",
+        "meta/muse-spark-1.1",
+        "opencode/big-pickle",
+        "kimi-code/k3",
+        "grok-4.5",
+    ],
+    # Everyday work: capable, cheaper, not the flagship.
+    "workhorse": [
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "anthropic/claude-sonnet-4",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.4",
+        "openai/gpt-5",
+        "kimi-code/kimi-for-coding",
+        "kimi-code/kimi-k2.5",
+        "kimi/k2",
+        "kimi/k2-thinking",
+        "moonshot/kimi-k2",
+        "grok-4",
+        "grok-3",
+    ],
+    # Drudgery tier: bulk edits, log scanning, reformatting, repetitive lookups.
+    "light": [
+        "claude-haiku-4-5",
+        "anthropic/claude-haiku-4",
+        "gpt-5.4-mini",
+        "openai/gpt-4.1",
+        "kimi-code/kimi-for-coding-highspeed",
+        "grok-3-mini",
+        "grok-4.5-build-free",
+        "opencode/deepseek-v4-flash-free",
+        "opencode/laguna-s-2.1-free",
+        "opencode/ling-3.0-flash-free",
+        "opencode/mimo-v2.5-free",
+        "opencode/nemotron-3-ultra-free",
+        "opencode/north-mini-code-free",
+    ],
+}
+
+# Fallback for a model that isn't in the table - matched against the normalized
+# name, first hit wins. Order matters: "light" is checked first so grok-3-mini
+# lands there rather than in workhorse on the "grok-3" substring, and
+# kimi-for-coding-highspeed doesn't get pulled up by "kimi-for-coding".
+CAPABILITY_CLASS_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("light", ("-mini", "-nano", "-free", "haiku", "flash", "highspeed", "gpt-4.")),
+    ("apex", ("fable", "mythos")),
+    ("frontier", ("opus", "-sol", "muse-spark", "big-pickle", "grok-4.5")),
+    ("workhorse", ("sonnet", "-terra", "-luna", "gpt-5", "kimi", "grok-")),
+]
+
+# Models the human has declared equivalent, so delegation between them is allowed
+# in BOTH directions no matter how the class table ranks them. "Sol" is codex's
+# frontier (gpt-5.6-sol); Opus is claude's. Devon wants that pairing explicit
+# rather than an emergent property of the table, so a lineup change or a stale
+# ladder entry can't quietly turn a peer handoff back into a blocked escalation.
+PEER_MODELS: list[set[str]] = [
+    {
+        "gpt-5.6-sol",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+    },
+]
 
 _helpers_launched = 0
 _helpers_lock = threading.Lock()
@@ -971,16 +1255,98 @@ def _normalize_model(model: str) -> str:
     return model.strip()
 
 
+def _opencode_model_tiers() -> list[str]:
+    return OPENCODE_MODEL_TIERS
+
+def _kimi_model_tiers() -> list[str]:
+    return KIMI_MODEL_TIERS
+
+def _grok_model_tiers() -> list[str]:
+    return GROK_MODEL_TIERS
+
 def model_rank(kind: str, model: str | None) -> int | None:
     """Position in the capability ladder; lower is more capable. None if unknown."""
     if not model:
         return None
-    tiers = CLAUDE_MODEL_TIERS if kind == "claude" else codex_model_tiers()
+    tiers = model_rank_ladder(kind)
     target = _normalize_model(model)
     for index, known in enumerate(tiers):
-        if target == known or target.startswith(known):
+        known_norm = _normalize_model(known)
+        if target == known_norm or target.startswith(known_norm) or known_norm.startswith(target):
             return index
+    # For opencode, also try substring match on model family (e.g. "opus", "sonnet", "haiku", "gpt-4", "mini", "flash")
+    # so that provider/model strings like "anthropic/claude-opus-4-6" still rank.
+    # If still unknown, return None and caller allows with log.
     return None
+
+
+def capability_class(model: str | None) -> int | None:
+    """Index into CAPABILITY_CLASSES; lower is more capable. None if unclassifiable.
+
+    Vendor-agnostic by design - the caller does not have to know which client a
+    model belongs to, which is what makes an equal-class comparison across two
+    different vendors' ladders meaningful.
+    """
+    if not model:
+        return None
+    target = _normalize_model(model)
+    # LONGEST match wins, not first. A cheap variant shares its family's prefix -
+    # grok-3-mini starts with grok-3, gpt-5.4-mini with gpt-5.4,
+    # kimi-for-coding-highspeed with kimi-for-coding - so a first-hit scan in class
+    # order would promote every one of them into the tier above the right one, which
+    # is the direction that matters: it would let a light helper pass as a workhorse.
+    best_index, best_len = None, -1
+    for index, name in enumerate(CAPABILITY_CLASSES):
+        for known in CAPABILITY_CLASS_MEMBERS[name]:
+            known_norm = _normalize_model(known)
+            if target.startswith(known_norm) and len(known_norm) > best_len:
+                best_index, best_len = index, len(known_norm)
+    if best_index is not None:
+        return best_index
+    for name, needles in CAPABILITY_CLASS_PATTERNS:
+        if any(needle in target for needle in needles):
+            return CAPABILITY_CLASSES.index(name)
+    return None
+
+
+def are_peers(one: str | None, other: str | None) -> bool:
+    """Has the human declared these two models equivalent? (Sol <-> Opus, etc.)"""
+    if not one or not other:
+        return False
+    left, right = _normalize_model(one), _normalize_model(other)
+
+    def in_group(model: str, group: set[str]) -> bool:
+        return any(model == _normalize_model(m) or model.startswith(_normalize_model(m))
+                   for m in group)
+
+    return any(in_group(left, group) and in_group(right, group) for group in PEER_MODELS)
+
+
+def sideways_or_cheaper(kind: str, model: str) -> list[str]:
+    """Example models a subagent on `model` may hand work to, for error messages."""
+    own_class = capability_class(model)
+    ladder = model_rank_ladder(kind)
+    allowed = [m for m in ladder
+               if are_peers(model, m)
+               or (own_class is not None and (capability_class(m) or 0) >= own_class)]
+    # Prefer the cheap end - that is what delegation is usually for.
+    return allowed[-2:] if allowed else ladder[-2:]
+
+
+def model_rank_ladder(kind: str) -> list[str]:
+    """The known model list for one client, most capable first."""
+    if kind == "claude":
+        return CLAUDE_MODEL_TIERS
+    if kind == "codex":
+        return codex_model_tiers()
+    if kind == "opencode":
+        return OPENCODE_MODEL_TIERS
+    if kind == "kimi":
+        return KIMI_MODEL_TIERS
+    if kind == "grok":
+        return GROK_MODEL_TIERS
+    return (CLAUDE_MODEL_TIERS + codex_model_tiers() + OPENCODE_MODEL_TIERS
+            + KIMI_MODEL_TIERS + GROK_MODEL_TIERS)
 
 
 def max_helpers() -> int:
@@ -994,8 +1360,11 @@ def enforce_delegation(kind: str, requested_model: str | None) -> None:
     """Gate a subagent launching its own helper. No-op for a top-level agent.
 
     Top-level launches are the human's call and stay unrestricted. A subagent
-    (AGENT_BRIDGE_JOB_ID is set) may only delegate downward, and only a bounded
-    number of times.
+    (AGENT_BRIDGE_JOB_ID is set) may delegate DOWN a capability class or SIDEWAYS
+    within one - including across vendors, which is how Sol hands work to Opus and
+    Opus hands work to Sol - and only a bounded number of times. Delegating UP is
+    still refused: that is escalation dressed as offloading, and the point of the
+    cap is that the delegating agent stays accountable for the result.
     """
     if not os.environ.get("AGENT_BRIDGE_JOB_ID"):
         return
@@ -1011,31 +1380,42 @@ def enforce_delegation(kind: str, requested_model: str | None) -> None:
         )
 
     own_model = os.environ.get("AGENT_BRIDGE_MODEL")
-    own_rank = model_rank(os.environ.get("AGENT_BRIDGE_PARENT", kind), own_model)
     if not requested_model:
         raise ValueError(
-            "as a subagent you must name the `model` you are delegating to, and it must be "
-            "less capable than your own. Delegate drudgery (mechanical edits, bulk reads, "
-            f"formatting, log scanning) to a cheaper model - for {kind} the cheaper tiers are "
-            f"{', '.join((CLAUDE_MODEL_TIERS if kind == 'claude' else codex_model_tiers())[-2:])}."
+            "as a subagent you must name the `model` you are delegating to. It may be at "
+            "your own level (a peer - e.g. a cross-vendor second opinion) or below it, but "
+            "not above. Delegate drudgery (mechanical edits, bulk reads, formatting, log "
+            f"scanning) to a cheaper model - for {kind} you could use "
+            f"{', '.join(sideways_or_cheaper(kind, own_model or ''))}."
         )
-    requested_rank = model_rank(kind, requested_model)
-    if requested_rank is None:
+
+    # A model unknown to BOTH the ladder and the class table can't be reasoned
+    # about at all - refuse rather than wave it through on a typo.
+    requested_class = capability_class(requested_model)
+    if model_rank(kind, requested_model) is None and requested_class is None:
         raise ValueError(
-            f"unknown model '{requested_model}' - cannot confirm it is a lower tier than "
-            "yours. Name a model from the known ladder: "
-            f"{', '.join(CLAUDE_MODEL_TIERS if kind == 'claude' else codex_model_tiers())}"
+            f"unknown model '{requested_model}' - cannot confirm it is at or below your own "
+            f"level. Name a model from the known ladder: "
+            f"{', '.join(model_rank_ladder(kind))}"
         )
-    # Unknown own_rank means we can't prove the delegation goes downward. Allow it, since
-    # the count cap still bounds the blast radius, but say so in the log.
-    if own_rank is None:
-        log(f"delegation: own model {own_model!r} not on the ladder; tier check skipped")
-    elif requested_rank <= own_rank:
+
+    own_class = capability_class(own_model)
+    if are_peers(own_model, requested_model):
+        # Declared equivalent by the human. Sideways by definition, both ways.
+        log(f"delegation: {own_model!r} -> {requested_model!r} allowed as declared peers")
+    elif own_class is None or requested_class is None:
+        # Can't prove the direction. Allow it - the count cap still bounds the
+        # blast radius - but leave a trail saying the check was skipped.
+        log(f"delegation: cannot class {own_model!r} or {requested_model!r}; "
+            "direction check skipped")
+    elif requested_class < own_class:
         raise RuntimeError(
-            f"you may only delegate DOWNWARD. You are running {own_model}; "
-            f"'{requested_model}' is equal or more capable, so this would escalate rather "
-            "than offload. Pick a cheaper model for the drudgery, and keep the judgement "
-            "calls yourself - you remain responsible for the result either way."
+            f"you may delegate SIDEWAYS or DOWNWARD, not upward. You are running "
+            f"{own_model} ({CAPABILITY_CLASSES[own_class]}); '{requested_model}' is "
+            f"{CAPABILITY_CLASSES[requested_class]}, a more capable class, so this would "
+            "escalate rather than offload. Pick a peer at your own level or a cheaper model "
+            f"({', '.join(sideways_or_cheaper(kind, own_model or ''))}), and keep the "
+            "judgement calls yourself - you remain responsible for the result either way."
         )
 
     with _helpers_lock:
@@ -1047,6 +1427,11 @@ def command_preview(command: list[str]) -> list[str]:
     if preview and preview[-1] == "-":
         return preview
     if len(preview) >= 2 and preview[-2] == "--":
+        preview[-1] = "<prompt>"
+        return preview
+    # Opencode: last arg is prompt without marker; also codex may have prompt as last after "-" removed?
+    # If last element looks like a long prompt (contains space) and not a flag, hide it.
+    if preview and len(preview[-1]) > 20 and " " in preview[-1] and not preview[-1].startswith("-"):
         preview[-1] = "<prompt>"
     return preview
 
@@ -1063,6 +1448,7 @@ def build_codex_command(
     if background and (inject_bridge or codex_has_bridge()):
         prompt = with_ask_parent_preamble(
             prompt, CODEX_ASK_PARENT_TOOL, CODEX_CHECK_NOTES_TOOL, CODEX_RAISE_CONCERN_TOOL,
+            CODEX_WARM_AGENTS_TOOL,
             sections=optional_string_list(args, "preamble_sections") or None,
             multi_phase=optional_bool(args, "multi_phase", True))
     cwd = resolve_cwd(args)
@@ -1122,6 +1508,41 @@ def build_codex_command(
     return command, prompt, cwd, timeout_seconds, meta
 
 
+def always_allowed_report_tools(
+    allowed: list[str], disallowed: list[str]
+) -> tuple[list[str], list[str]]:
+    """Force the parent-report channel into the permission config, unconditionally.
+
+    A sandboxed child that cannot finish its task must still be able to SAY SO. If
+    the only channel back to its parent is itself gated behind a permission prompt,
+    the failure arrives as silence: the job burns its timeout and reports nothing,
+    which is the single worst outcome the bridge can produce - worse than a refusal,
+    because nobody learns why. So these three tools are not a default the caller can
+    forget; they are added to every background launch whether or not an allowlist was
+    passed, and removed from the denylist if a caller put them there.
+
+    Safe to always add: claude's --allowedTools is an ADDITIVE auto-approve list, not
+    an exhaustive whitelist (verified against the installed CLI - a child launched
+    with `--allowedTools Read` still used Bash without prompting). Naming three tools
+    here therefore costs the caller no other capability. Under --print, an unapproved
+    MCP call would otherwise be DENIED rather than prompted, so without this the
+    subagent can see ask_parent and never manage to call it - the same failure the
+    codex `default_tools_approval_mode="approve"` override already fixes on that side.
+    """
+    for required in REPORT_CHANNEL_TOOLS:
+        if required not in allowed:
+            allowed = [*allowed, required]
+    # A deny beats an allow, so a caller-supplied denylist would re-gag the child
+    # even with the tools allowlisted. Drop those entries and leave a trail.
+    gagged = [t for t in disallowed if t in REPORT_CHANNEL_TOOLS]
+    if gagged:
+        log(f"ignoring disallowed_tools {', '.join(gagged)}: the parent report channel "
+            "(ask_parent / check_notes / raise_concern) is always allowed, so a child that "
+            "cannot finish can still report instead of timing out silently")
+        disallowed = [t for t in disallowed if t not in REPORT_CHANNEL_TOOLS]
+    return allowed, disallowed
+
+
 def build_claude_command(args: dict[str, Any], background: bool = False) -> tuple[list[str], str, str, int, dict[str, Any]]:
     prompt = require_str(args, "prompt")
     if background:
@@ -1149,13 +1570,9 @@ def build_claude_command(args: dict[str, Any], background: bool = False) -> tupl
     add_dirs = optional_string_list(args, "add_dirs")
     allowed_tools = optional_string_list(args, "allowed_tools")
     disallowed_tools = optional_string_list(args, "disallowed_tools")
-    # An allowlist is exhaustive: if the caller passed one and forgot ask_parent, the
-    # subagent is told it can ask (via the preamble) and then blocked from doing so.
-    # Add it back rather than let that contradiction ship.
-    if background and allowed_tools:
-        for required in (ASK_PARENT_TOOL, CHECK_NOTES_TOOL, RAISE_CONCERN_TOOL):
-            if required not in allowed_tools:
-                allowed_tools = [*allowed_tools, required]
+    if background:
+        allowed_tools, disallowed_tools = always_allowed_report_tools(
+            allowed_tools, disallowed_tools)
     extra_args = optional_string_list(args, "extra_args")
 
     command = [
@@ -1191,6 +1608,360 @@ def build_claude_command(args: dict[str, Any], background: bool = False) -> tupl
         "session_id": None if no_session_persistence else session_id,
     }
     return command, prompt, cwd, timeout_seconds, meta
+
+
+def build_opencode_command(
+    args: dict[str, Any], background: bool = False
+) -> tuple[list[str], str, str, int, dict[str, Any]]:
+    """Build an `opencode run` command.
+
+    Opencode's CLI: `opencode run --format json --dir <cwd> -m <model> <prompt>`
+    Background launches advertise the parent question channel (ask_parent / check_notes)
+    using opencode's direct tool names (no mcp__ prefix).
+    """
+    prompt = require_str(args, "prompt")
+    if background and (opencode_has_bridge() or os.environ.get("AGENT_BRIDGE_PARENT") == "opencode"):
+        # opencode always has bridge if we registered it globally, but check file anyway
+        prompt = with_ask_parent_preamble(
+            prompt,
+            OPENCODE_ASK_PARENT_TOOL,
+            OPENCODE_CHECK_NOTES_TOOL,
+            OPENCODE_RAISE_CONCERN_TOOL,
+            OPENCODE_WARM_AGENTS_TOOL,
+            sections=optional_string_list(args, "preamble_sections") or None,
+            multi_phase=optional_bool(args, "multi_phase", True),
+        )
+    cwd = resolve_cwd(args)
+    timeout_seconds = optional_int(args, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1, 24 * 60 * 60)
+    opencode_bin = os.environ.get("OPENCODE_BIN", "opencode")
+
+    model = optional_str(args, "model")
+    variant = optional_str(args, "variant")
+    agent_name = optional_str(args, "agent")
+    output_format = enum_value(args, "output_format", "json", {"json", "default"})
+    # Always use json for easier parsing of reply + tokens + session_id; caller can request default
+    # but we normalize to json internally.
+    if output_format not in ("json", "default"):
+        output_format = "json"
+
+    extra_args = optional_string_list(args, "extra_args")
+    no_session_persistence = False  # opencode persists by default, no flag to disable in same way
+
+    command = [
+        opencode_bin,
+        "run",
+        "--format",
+        output_format,
+        "--dir",
+        cwd,
+    ]
+    if model:
+        command.extend(["--model", model])
+    if variant:
+        command.extend(["--variant", variant])
+    if agent_name:
+        command.extend(["--agent", agent_name])
+
+    command.extend(extra_args)
+    # Opencode takes prompt as positional at end; we already ensured prompt is non-empty
+    command.append(prompt)
+
+    meta = {
+        "session_persist": not no_session_persistence,
+        "model": model,
+        "resume": {"cwd": cwd},
+    }
+    # For run_command compatibility, we return prompt as second element but it's already in command.
+    # We will treat opencode specially: feeds_stdin is False, prompt in command.
+    # The second return value is still prompt for collect_job threading, but we won't feed it via stdin.
+    return command, prompt, cwd, timeout_seconds, meta
+
+
+def build_kimi_command(
+    args: dict[str, Any], background: bool = False
+) -> tuple[list[str], str, str, int, dict[str, Any]]:
+    """Build a `kimi -p` command.
+
+    Kimi Code CLI: `kimi -p <prompt> --output-format stream-json -m <model>`
+    Cwd is handled via subprocess cwd, since kimi has no --dir flag.
+    Background launches advertise the parent question channel (ask_parent)
+    using kimi's mcp__agent-bridge__* naming.
+    """
+    prompt = require_str(args, "prompt")
+    if background and (kimi_has_bridge() or os.environ.get("AGENT_BRIDGE_PARENT") == "kimi"):
+        prompt = with_ask_parent_preamble(
+            prompt,
+            KIMI_ASK_PARENT_TOOL,
+            KIMI_CHECK_NOTES_TOOL,
+            KIMI_RAISE_CONCERN_TOOL,
+            KIMI_WARM_AGENTS_TOOL,
+            sections=optional_string_list(args, "preamble_sections") or None,
+            multi_phase=optional_bool(args, "multi_phase", True),
+        )
+    cwd = resolve_cwd(args)
+    timeout_seconds = optional_int(args, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1, 24 * 60 * 60)
+    # Prefer KIMI_BIN env, then fallback to ~/.kimi-code/bin/kimi, then plain "kimi"
+    kimi_bin = os.environ.get("KIMI_BIN") or os.environ.get("KIMI_CODE_BIN")
+    if not kimi_bin:
+        default_path = Path("~/.kimi-code/bin/kimi").expanduser()
+        kimi_bin = str(default_path) if default_path.exists() else "kimi"
+
+    model = optional_str(args, "model")
+    output_format = enum_value(args, "output_format", "stream-json", {"stream-json", "text"})
+    extra_args = optional_string_list(args, "extra_args")
+    yolo = optional_bool(args, "yolo", True)  # default to yolo/auto for non-interactive
+
+    command = [kimi_bin]
+    if model:
+        command.extend(["-m", model])
+    # prompt mode
+    command.extend(["-p", prompt, "--output-format", output_format])
+    if yolo:
+        # kimi -p already auto, but --yolo flag not allowed with -p per docs; we use default auto behavior
+        pass
+    command.extend(extra_args)
+
+    meta = {
+        "session_persist": True,  # kimi persists sessions automatically
+        "model": model,
+        "resume": {"cwd": cwd},
+    }
+    return command, prompt, cwd, timeout_seconds, meta
+
+
+def _parse_kimi_stream_json(stdout: str) -> dict[str, Any]:
+    """Parse `kimi -p --output-format stream-json` JSONL output.
+
+    Each line is a JSON object with possible `type` or message structure.
+    We collect assistant text and try to extract token usage if present.
+    """
+    reply_parts: list[str] = []
+    usage: dict[str, Any] | None = None
+    session_id: str | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            # if text format, treat whole stdout later
+            continue
+        if not isinstance(event, dict):
+            continue
+        # Try to detect session id
+        sid = event.get("session_id") or event.get("sessionId") or event.get("id")
+        if sid and isinstance(sid, str) and len(sid) > 8 and not session_id:
+            # heuristic: session ids often contain hyphens or are long
+            if "-" in sid or sid.startswith("session_"):
+                session_id = sid
+        # Kimi stream-json typical shape: {"role":"assistant","content":...} or {"type":"..."}
+        # Assistant message
+        if event.get("role") == "assistant":
+            content = event.get("content")
+            if isinstance(content, str):
+                reply_parts.append(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        txt = item.get("text") or item.get("content")
+                        if txt:
+                            reply_parts.append(txt)
+                    elif isinstance(item, str):
+                        reply_parts.append(item)
+        # tool call result etc
+        if event.get("type") == "assistant" and event.get("message"):
+            msg = event["message"]
+            if isinstance(msg, dict):
+                c = msg.get("content")
+                if isinstance(c, str):
+                    reply_parts.append(c)
+        # token usage often in event with usage field
+        if "usage" in event and isinstance(event["usage"], dict):
+            usage = event["usage"]
+        if "tokens" in event and isinstance(event["tokens"], dict):
+            usage = event["tokens"]
+    reply = "\n".join(reply_parts).strip()
+    if not reply:
+        # fallback: if stdout is plain text (when --output-format text), use raw
+        # but we already have json lines, so try to return whatever non-json lines exist
+        non_json = []
+        for line in stdout.splitlines():
+            try:
+                json.loads(line)
+            except:
+                if line.strip():
+                    non_json.append(line)
+        if non_json:
+            reply = "\n".join(non_json).strip()
+        else:
+            reply = stdout.strip()
+    return {"reply": reply, "usage": usage, "session_id": session_id}
+
+
+def build_grok_command(
+    args: dict[str, Any], background: bool = False
+) -> tuple[list[str], str, str, int, dict[str, Any]]:
+    """Build a `grok -p` command.
+
+    Grok CLI: `grok -p <prompt> --output-format json|plain -m <model> --cwd <cwd>`
+    Background launches advertise the parent question channel using direct tool names
+    (grok exposes tools as direct names like ask_parent, per logs).
+    """
+    prompt = require_str(args, "prompt")
+    if background and (grok_has_bridge() or os.environ.get("AGENT_BRIDGE_PARENT") == "grok"):
+        prompt = with_ask_parent_preamble(
+            prompt,
+            GROK_ASK_PARENT_TOOL,
+            GROK_CHECK_NOTES_TOOL,
+            GROK_RAISE_CONCERN_TOOL,
+            GROK_WARM_AGENTS_TOOL,
+            sections=optional_string_list(args, "preamble_sections") or None,
+            multi_phase=optional_bool(args, "multi_phase", True),
+        )
+    cwd = resolve_cwd(args)
+    timeout_seconds = optional_int(args, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1, 24 * 60 * 60)
+    grok_bin = os.environ.get("GROK_BIN") or "/Users/devonedwards/.local/bin/grok"
+    if not Path(grok_bin).exists():
+        grok_bin = os.environ.get("GROK_BIN", "grok")
+
+    model = optional_str(args, "model")
+    output_format = enum_value(args, "output_format", "json", {"json", "plain", "streaming-json"})
+    extra_args = optional_string_list(args, "extra_args")
+
+    command = [grok_bin, "-p", prompt, "--output-format", output_format]
+    if model:
+        command.extend(["-m", model])
+    # Grok has --cwd flag per help
+    command.extend(["--cwd", cwd])
+    if background:
+        # The child must always be able to report back - see the comment on
+        # GROK_REPORT_CHANNEL_ALLOW_RULES and always_allowed_report_tools().
+        for rule in GROK_REPORT_CHANNEL_ALLOW_RULES:
+            command.extend(["--allow", rule])
+    command.extend(extra_args)
+
+    meta = {
+        "session_persist": True,
+        "model": model,
+        "resume": {"cwd": cwd},
+    }
+    return command, prompt, cwd, timeout_seconds, meta
+
+
+def _parse_grok_json(stdout: str) -> dict[str, Any]:
+    """Parse `grok -p --output-format json` output.
+
+    Example:
+    {
+      "text": "Hello",
+      "sessionId": "...",
+      "usage": {"input_tokens":..., "output_tokens":..., "total_tokens":...},
+      ...
+    }
+    Could also be plain text if format=plain.
+    """
+    reply_parts: list[str] = []
+    usage: dict[str, Any] | None = None
+    session_id: str | None = None
+    # Try parse entire stdout as json first (single object)
+    try:
+        obj = json.loads(stdout.strip())
+        if isinstance(obj, dict):
+            if obj.get("text"):
+                reply_parts.append(obj["text"])
+            if obj.get("sessionId"):
+                session_id = obj["sessionId"]
+            if obj.get("usage"):
+                usage = obj["usage"]
+            # also handle streaming-json lines
+            if reply_parts:
+                return {"reply": "\n".join(reply_parts).strip(), "usage": usage, "session_id": session_id}
+    except json.JSONDecodeError:
+        pass
+    # Fallback: JSONL streaming-json
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("text"):
+            reply_parts.append(event["text"])
+        if event.get("sessionId") and not session_id:
+            session_id = event["sessionId"]
+        if event.get("usage"):
+            usage = event["usage"]
+        # For streaming-json, sometimes content in different shape
+        if event.get("role") == "assistant" and event.get("content"):
+            c = event["content"]
+            if isinstance(c, str):
+                reply_parts.append(c)
+            elif isinstance(c, list):
+                for item in c:
+                    if isinstance(item, dict) and item.get("text"):
+                        reply_parts.append(item["text"])
+    reply = "\n".join(reply_parts).strip()
+    if not reply:
+        # plain text
+        reply = stdout.strip()
+    return {"reply": reply, "usage": usage, "session_id": session_id}
+
+
+def _parse_opencode_json_events(stdout: str) -> dict[str, Any]:
+    """Parse `opencode run --format json` JSONL output.
+
+    Each line is an event with `type` = step_start, text, step_finish, etc.
+    We collect text parts and final tokens + session id.
+    """
+    reply_parts: list[str] = []
+    usage: dict[str, Any] | None = None
+    session_id: str | None = None
+    cost: float | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        # Extract session id if present
+        sid = event.get("sessionID") or event.get("session_id") or (event.get("part") or {}).get("sessionID")
+        if sid and not session_id:
+            session_id = sid
+        etype = event.get("type")
+        if etype == "text":
+            part = event.get("part") or {}
+            text = part.get("text") or event.get("text")
+            if text:
+                reply_parts.append(text)
+        elif etype == "step_finish":
+            part = event.get("part") or {}
+            tokens = part.get("tokens") or event.get("tokens")
+            if tokens:
+                usage = tokens
+            if part.get("cost") is not None:
+                cost = part.get("cost")
+        elif etype == "error":
+            # Include error text as reply
+            part = event.get("part") or {}
+            err_text = part.get("text") or event.get("error") or ""
+            if err_text:
+                reply_parts.append(f"[error] {err_text}")
+    # Some opencode versions emit message with nested structure; fallback to raw stdout if no text parts found
+    reply = "\n".join(reply_parts).strip()
+    if not reply:
+        # If json parsing yielded nothing, maybe stdout was already plain text (when format=default)
+        # Return stdout as reply
+        reply = stdout.strip()
+    return {"reply": reply, "usage": usage, "session_id": session_id, "cost": cost}
 
 
 def run_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, max_output_chars: int) -> dict[str, Any]:
@@ -1249,7 +2020,7 @@ def git_commit_paths(cwd: str, paths: list[str], message: str) -> dict[str, Any]
         return {"committed": False, "hash": None, "detail": f"exception: {exc}"}
 
 
-def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, commit_paths: list[str] | None = None, commit_message: str | None = None, meta: dict[str, Any] | None = None, job_id: str | None = None) -> dict[str, Any]:
+def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, commit_paths: list[str] | None = None, commit_message: str | None = None, meta: dict[str, Any] | None = None, job_id: str | None = None, task: str | None = None) -> dict[str, Any]:
     enforce_depth()
     enforce_delegation(kind, (meta or {}).get("model"))
     # The job id reaches the child so ask_parent can address questions back at this job.
@@ -1284,6 +2055,14 @@ def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, 
         session_id=meta.get("session_id"),
         model=meta.get("model"),
         resume=meta.get("resume"),
+        # Kept so a warm agent is identifiable later by what it was working on -
+        # "which of these six sessions knows the auth refactor" is unanswerable from
+        # a job id alone. The CALLER's original prompt, deliberately: `prompt` here is
+        # None for every client that carries its prompt inside the command (grok,
+        # kimi, opencode, and claude unless it's piped), and where it is set it has
+        # already been preamble-wrapped, so 400 chars of it would be boilerplate.
+        task=task,
+        last_used_at=time.time(),
     )
 
     with jobs_lock:
@@ -1341,6 +2120,11 @@ def collect_job(job: Job, prompt: str | None) -> None:
     except Exception:  # pragma: no cover - defensive
         pass
 
+    # Enrichment is what discovers the session id for codex, so the roster entry has to
+    # be written after it - otherwise the agent looks unresumable and never gets offered
+    # for reuse. Survives a server restart from here on.
+    save_to_roster(job)
+
     # Optional post-agent commit (Codex jobs given commit_paths). Runs on the host,
     # outside the agent sandbox, so it lands even though workspace-write blocks .git.
     # Only on a clean success; explicit paths only, never `git add -A`.
@@ -1350,11 +2134,186 @@ def collect_job(job: Job, prompt: str | None) -> None:
             job.commit = result
 
 
+# ---------------------------------------------------------------------------
+# The warm-agent roster: reuse an agent that already knows things.
+#
+# An agent that has been working a problem has paid for its context - it has read
+# the files, learned the layout, had its wrong assumptions corrected, and been told
+# things it could not have guessed. Throwing that away and launching a fresh agent
+# means paying for all of it again, in tokens and in wall-clock, to arrive back
+# where the last one already was. continue_* has always been able to resume a
+# session; what was missing is that the job roster lived only in this process's
+# memory, so every server restart orphaned every warm agent. Their SESSIONS were
+# still on disk and still resumable - the bridge just lost the paperwork.
+#
+# So the roster is written to disk. It is deliberately small: enough to identify an
+# agent, judge whether it is still worth resuming, and hand it to continue_*.
+#
+# "At least to a point" is the other half. Reuse is not free forever: context grows,
+# goes stale against a moving repo, and drags an agent toward the shape of its old
+# task. So each entry carries a recommendation rather than an invitation, and an
+# agent can go stale (by age), get crowded (by turns), or be retired outright.
+# ---------------------------------------------------------------------------
+
+ROSTER_DIR = STATE_DIR / "roster"
+# Past these, reuse stops being the cheap option: a long-running session costs more
+# per turn to re-read than a fresh agent costs to start, and a days-old session's
+# picture of the repo may be actively wrong. Both tunable - these are judgement
+# calls, not physics.
+ROSTER_STALE_AFTER_SECONDS = float(
+    os.environ.get("AGENT_BRIDGE_ROSTER_STALE_HOURS", "24")) * 3600
+ROSTER_CROWDED_AFTER_TURNS = int(os.environ.get("AGENT_BRIDGE_ROSTER_MAX_TURNS", "12"))
+ROSTER_KEEP = int(os.environ.get("AGENT_BRIDGE_ROSTER_KEEP", "200"))
+
+
+def _roster_dir() -> Path:
+    ROSTER_DIR.mkdir(parents=True, exist_ok=True)
+    return ROSTER_DIR
+
+
+def save_to_roster(job: Job) -> None:
+    """Record a resumable agent on disk. Never raises - this is bookkeeping.
+
+    Only agents that can actually be resumed earn an entry: without a session id
+    there is nothing to continue, so listing one would be an empty promise.
+    """
+    try:
+        with job.lock:
+            if not job.session_id or job.returncode is None:
+                return
+            record = {
+                "job_id": job.id,
+                "kind": job.kind,
+                "model": job.model,
+                "cwd": job.cwd,
+                "session_id": job.session_id,
+                "resume": job.resume,
+                "task": (job.task or "")[:400],
+                "turns": job.turns,
+                "started_at": job.started_at,
+                "last_used_at": job.last_used_at or job.finished_at or job.started_at,
+                "tokens": job.tokens,
+                "status": job.status,
+                "retired": job.retired,
+                "retired_reason": job.retired_reason,
+            }
+        target = _roster_dir() / f"{job.id}.json"
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, target)
+        _prune_roster()
+    except Exception as exc:  # pragma: no cover - defensive
+        log(f"roster: could not record job {job.id}: {exc}")
+
+
+def _iter_roster() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        for path in _roster_dir().glob("*.json"):
+            try:
+                out.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                continue
+    except OSError:
+        return out
+    out.sort(key=lambda r: r.get("last_used_at") or 0, reverse=True)
+    return out
+
+
+def _prune_roster() -> None:
+    """Drop the oldest entries past ROSTER_KEEP so the roster can't grow forever."""
+    records = _iter_roster()
+    for record in records[ROSTER_KEEP:]:
+        try:
+            (_roster_dir() / f"{record['job_id']}.json").unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def rehydrate_job(job_id: str) -> Job | None:
+    """Rebuild an in-memory Job from the roster so continue_* can resume it.
+
+    This is what makes persistence real rather than decorative: after a restart the
+    bridge can hand a warm agent straight back to continue_*, instead of reporting
+    'unknown job_id' about a session that is sitting on disk fully intact.
+    """
+    record = next((r for r in _iter_roster() if r.get("job_id") == job_id), None)
+    if not record:
+        return None
+    job = Job(
+        id=record["job_id"],
+        kind=record.get("kind") or "claude",
+        command=[],
+        cwd=record.get("cwd") or str(Path.home()),
+        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+        started_at=record.get("started_at") or time.time(),
+        process=None,
+        # A rehydrated job is finished by definition - the process died with the old
+        # server. Marking it succeeded is what lets continue_* past its running check.
+        returncode=0,
+        finished_at=record.get("last_used_at"),
+        session_id=record.get("session_id"),
+        model=record.get("model"),
+        tokens=record.get("tokens"),
+        resume=record.get("resume"),
+        # Enrichment reads a live transcript/rollout; nothing new to learn here, and
+        # attempting it would re-scan files for a process that no longer exists.
+        enriched=True,
+        task=record.get("task"),
+        turns=record.get("turns") or 1,
+        last_used_at=record.get("last_used_at"),
+        retired=bool(record.get("retired")),
+        retired_reason=record.get("retired_reason"),
+        rehydrated=True,
+    )
+    with jobs_lock:
+        jobs.setdefault(job.id, job)
+        return jobs[job.id]
+
+
+def note_reuse(job: Job) -> None:
+    """Record that a warm agent was resumed: one more turn, clock reset."""
+    with job.lock:
+        job.turns += 1
+        job.last_used_at = time.time()
+    save_to_roster(job)
+
+
+def roster_verdict(record: dict[str, Any]) -> tuple[str, str]:
+    """Should this agent be reused? Returns (verdict, why) for the human to act on."""
+    if record.get("retired"):
+        return "retired", record.get("retired_reason") or "retired by the human"
+    if record.get("status") not in (None, "succeeded"):
+        return "suspect", (
+            f"its last run ended {record.get('status')} - read agent_result before "
+            "trusting what it thinks it knows")
+    age = time.time() - (record.get("last_used_at") or 0)
+    turns = record.get("turns") or 1
+    if age > ROSTER_STALE_AFTER_SECONDS:
+        return "stale", (
+            f"idle {round(age / 3600, 1)}h - its picture of the repo may be out of date, "
+            "so re-brief it or start fresh")
+    if turns >= ROSTER_CROWDED_AFTER_TURNS:
+        return "crowded", (
+            f"{turns} turns of context - re-reading it may now cost more than a fresh "
+            "agent would, so prefer this one only if that context is the point")
+    return "reuse", (
+        f"warm: {turns} turn(s), last used {round(age / 60)}m ago - it already has the "
+        "context, so resuming beats re-teaching a new agent")
+
+
 def get_job(job_id: str) -> Job:
     with jobs_lock:
         job = jobs.get(job_id)
     if job is None:
-        raise ValueError(f"unknown job_id: {job_id}")
+        # Not in memory - it may predate a server restart. Its session is likely
+        # still on disk, so try the roster before declaring it unknown.
+        job = rehydrate_job(job_id)
+    if job is None:
+        raise ValueError(
+            f"unknown job_id: {job_id}. It is not running here and not in the warm-agent "
+            "roster; call warm_agents to see which agents are still resumable."
+        )
     return job
 
 
@@ -1466,7 +2425,8 @@ def enrich_job(job: Job) -> None:
     For codex: session id is printed to stdout ("session id: <uuid>") and the rollout
     JSONL under ~/.codex/sessions carries token_count events. For claude: the session id
     is pre-assigned (we passed --session-id) and the transcript under ~/.claude/projects
-    carries per-turn usage. Safe to call repeatedly; cheap and best-effort.
+    carries per-turn usage. For opencode: we parse the JSONL stdout that was captured via
+    `opencode run --format json`. Safe to call repeatedly; cheap and best-effort.
     """
     with job.lock:
         kind = job.kind
@@ -1509,6 +2469,93 @@ def enrich_job(job: Job) -> None:
         else:
             with job.lock:
                 job.enriched = True
+    elif kind == "opencode":
+        # Opencode stdout is JSONL events; parse for session_id and tokens
+        try:
+            parsed = _parse_opencode_json_events(streams or job.stdout or "")
+            opencode_tokens = parsed.get("usage")
+            opencode_sid = parsed.get("session_id")
+            # Normalize opencode token shape to generic {input, output, total}
+            norm_tokens: dict[str, Any] | None = None
+            if opencode_tokens:
+                inp = opencode_tokens.get("input") or opencode_tokens.get("input_tokens") or 0
+                out = opencode_tokens.get("output") or opencode_tokens.get("output_tokens") or 0
+                tot = opencode_tokens.get("total") or opencode_tokens.get("total_tokens") or (inp + out)
+                reasoning = opencode_tokens.get("reasoning") or 0
+                cache = opencode_tokens.get("cache") or {}
+                norm_tokens = {
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "total_tokens": tot,
+                    "reasoning_output_tokens": reasoning,
+                    "cache_read_input_tokens": cache.get("read", 0),
+                    "cache_creation_input_tokens": cache.get("write", 0),
+                }
+            with job.lock:
+                if opencode_sid and not job.session_id:
+                    job.session_id = opencode_sid
+                if norm_tokens:
+                    job.tokens = norm_tokens
+                job.enriched = True
+        except Exception:
+            with job.lock:
+                job.enriched = True
+    elif kind == "kimi":
+        try:
+            parsed = _parse_kimi_stream_json(streams or job.stdout or "")
+            kimi_tokens = parsed.get("usage")
+            kimi_sid = parsed.get("session_id")
+            norm_tokens = None
+            if kimi_tokens:
+                inp = kimi_tokens.get("input") or kimi_tokens.get("input_tokens") or kimi_tokens.get("prompt_tokens") or 0
+                out = kimi_tokens.get("output") or kimi_tokens.get("output_tokens") or kimi_tokens.get("completion_tokens") or 0
+                tot = kimi_tokens.get("total") or kimi_tokens.get("total_tokens") or (inp + out)
+                norm_tokens = {
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "total_tokens": tot,
+                }
+            with job.lock:
+                if kimi_sid and not job.session_id:
+                    job.session_id = kimi_sid
+                if norm_tokens:
+                    job.tokens = norm_tokens
+                job.enriched = True
+        except Exception:
+            with job.lock:
+                job.enriched = True
+    elif kind == "grok":
+        try:
+            parsed = _parse_grok_json(streams or job.stdout or "")
+            grok_tokens = parsed.get("usage")
+            grok_sid = parsed.get("session_id")
+            norm_tokens = None
+            if grok_tokens:
+                inp = grok_tokens.get("input_tokens") or grok_tokens.get("input") or 0
+                out = grok_tokens.get("output_tokens") or grok_tokens.get("output") or 0
+                tot = grok_tokens.get("total_tokens") or grok_tokens.get("total") or (inp + out)
+                # grok also has cache_read_input_tokens
+                cache_read = grok_tokens.get("cache_read_input_tokens") or 0
+                reasoning = grok_tokens.get("reasoning_tokens") or grok_tokens.get("reasoning") or 0
+                norm_tokens = {
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "total_tokens": tot,
+                    "cache_read_input_tokens": cache_read,
+                    "reasoning_output_tokens": reasoning,
+                }
+            with job.lock:
+                if grok_sid and not job.session_id:
+                    job.session_id = grok_sid
+                if norm_tokens:
+                    job.tokens = norm_tokens
+                job.enriched = True
+        except Exception:
+            with job.lock:
+                job.enriched = True
+    else:
+        with job.lock:
+            job.enriched = True
 
 
 def _job_token_summary(tokens: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1606,10 +2653,37 @@ def summarize_job(job: Job) -> dict[str, Any]:
             )
         elif kind == "claude":
             summary["resume_command"] = f"claude --resume {session_id}"
+        elif kind == "opencode":
+            summary["resume_command"] = f"opencode run --session {session_id}"
+            summary["continue_with"] = (
+                f"continue_opencode_agent(job_id={job.id!r}, prompt=...) to interject"
+            )
+        elif kind == "kimi":
+            summary["resume_command"] = f"kimi --session {session_id} -p <prompt>"
+            summary["continue_with"] = (
+                f"continue_kimi_agent(job_id={job.id!r}, prompt=...) to interject"
+            )
+        elif kind == "grok":
+            summary["resume_command"] = f"grok --resume {session_id} -p <prompt>"
+            summary["continue_with"] = (
+                f"continue_grok_agent(job_id={job.id!r}, prompt=...) to interject"
+            )
     elif kind == "codex":
         summary["session_note"] = (
             "session id not captured yet (available once the job finishes; codex exec is "
             "single-turn, so resume/continue after it completes)"
+        )
+    elif kind == "opencode":
+        summary["session_note"] = (
+            "session id not captured yet (available once the job finishes and JSON output is parsed)"
+        )
+    elif kind == "kimi":
+        summary["session_note"] = (
+            "session id not captured yet (available once the job finishes and JSON output is parsed)"
+        )
+    elif kind == "grok":
+        summary["session_note"] = (
+            "session id not captured yet (available once the job finishes and JSON output is parsed)"
         )
     return summary
 
@@ -1649,6 +2723,69 @@ def enrich_sync_result(kind: str, result: dict[str, Any], meta: dict[str, Any]) 
                         result["model"] = claude_model
                     result["tokens"] = _job_token_summary(tok)
                 result["resume_command"] = f"claude --resume {session_id}"
+        elif kind == "opencode":
+            # For opencode, stdout is JSONL. Parse if result already has stdout.
+            raw = f"{result.get('stderr','') or ''}\n{result.get('stdout','') or ''}"
+            parsed = _parse_opencode_json_events(raw)
+            if parsed.get("session_id"):
+                result["session_id"] = parsed["session_id"]
+                result["resume_command"] = f"opencode run --session {parsed['session_id']}"
+            if parsed.get("usage"):
+                usage = parsed["usage"]
+                norm = {
+                    "input_tokens": usage.get("input") or usage.get("input_tokens") or 0,
+                    "output_tokens": usage.get("output") or usage.get("output_tokens") or 0,
+                    "total_tokens": usage.get("total") or usage.get("total_tokens") or 0,
+                }
+                # Preserve reasoning/cache if present
+                if usage.get("reasoning"):
+                    norm["reasoning_output_tokens"] = usage["reasoning"]
+                result["tokens"] = _job_token_summary(norm)
+            # Replace stdout with cleaned reply for readability
+            if parsed.get("reply"):
+                # Keep original JSONL in a separate field if needed? For now truncate reply as stdout
+                # But preserve original under raw_stdout if caller wants
+                result["raw_stdout"] = result.get("stdout")
+                result["stdout"] = truncate_text(parsed["reply"], 30000)
+                result["reply"] = parsed["reply"]
+        elif kind == "kimi":
+            raw = f"{result.get('stderr','') or ''}\n{result.get('stdout','') or ''}"
+            parsed = _parse_kimi_stream_json(raw)
+            if parsed.get("session_id"):
+                result["session_id"] = parsed["session_id"]
+                result["resume_command"] = f"kimi --session {parsed['session_id']} -p <prompt>"
+            if parsed.get("usage"):
+                usage = parsed["usage"]
+                norm = {
+                    "input_tokens": usage.get("input") or usage.get("input_tokens") or usage.get("prompt_tokens") or 0,
+                    "output_tokens": usage.get("output") or usage.get("output_tokens") or usage.get("completion_tokens") or 0,
+                    "total_tokens": usage.get("total") or usage.get("total_tokens") or 0,
+                }
+                result["tokens"] = _job_token_summary(norm)
+            if parsed.get("reply"):
+                result["raw_stdout"] = result.get("stdout")
+                result["stdout"] = truncate_text(parsed["reply"], 30000)
+                result["reply"] = parsed["reply"]
+        elif kind == "grok":
+            raw = f"{result.get('stderr','') or ''}\n{result.get('stdout','') or ''}"
+            parsed = _parse_grok_json(raw)
+            if parsed.get("session_id"):
+                result["session_id"] = parsed["session_id"]
+                result["resume_command"] = f"grok --resume {parsed['session_id']} -p <prompt>"
+            if parsed.get("usage"):
+                usage = parsed["usage"]
+                norm = {
+                    "input_tokens": usage.get("input_tokens") or usage.get("input") or 0,
+                    "output_tokens": usage.get("output_tokens") or usage.get("output") or 0,
+                    "total_tokens": usage.get("total_tokens") or usage.get("total") or 0,
+                    "cache_read_input_tokens": usage.get("cache_read_input_tokens") or 0,
+                    "reasoning_output_tokens": usage.get("reasoning_tokens") or 0,
+                }
+                result["tokens"] = _job_token_summary(norm)
+            if parsed.get("reply"):
+                result["raw_stdout"] = result.get("stdout")
+                result["stdout"] = truncate_text(parsed["reply"], 30000)
+                result["reply"] = parsed["reply"]
     except Exception:  # pragma: no cover - defensive
         pass
     return result
@@ -1673,7 +2810,7 @@ def launch_codex(args: dict[str, Any]) -> dict[str, Any]:
     command, prompt, cwd, timeout_seconds, meta = build_codex_command(args, background=True, job_id=job_id)
     commit_paths = optional_string_list(args, "commit_paths")
     commit_message = optional_str(args, "commit_message")
-    return tool_response(launch_command("codex", command, prompt, cwd, timeout_seconds, commit_paths=commit_paths, commit_message=commit_message, meta=meta, job_id=job_id))
+    return tool_response(launch_command("codex", command, prompt, cwd, timeout_seconds, commit_paths=commit_paths, commit_message=commit_message, meta=meta, job_id=job_id, task=optional_str(args, "prompt")))
 
 
 def run_claude(args: dict[str, Any]) -> dict[str, Any]:
@@ -1687,7 +2824,352 @@ def run_claude(args: dict[str, Any]) -> dict[str, Any]:
 
 def launch_claude(args: dict[str, Any]) -> dict[str, Any]:
     command, prompt, cwd, timeout_seconds, meta = build_claude_command(args, background=True)
-    return tool_response(launch_command("claude", command, None if command[-1] != "-" else prompt, cwd, timeout_seconds, meta=meta))
+    return tool_response(launch_command("claude", command, None if command[-1] != "-" else prompt, cwd, timeout_seconds, meta=meta, task=optional_str(args, "prompt")))
+
+
+def run_opencode(args: dict[str, Any]) -> dict[str, Any]:
+    command, prompt, cwd, timeout_seconds, meta = build_opencode_command(args)
+    enforce_delegation("opencode", meta.get("model"))
+    max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
+    # opencode prompt is already embedded in command; no stdin feeding
+    result = run_command("opencode", command, None, cwd, timeout_seconds, max_output_chars)
+    # run_command captured JSONL; parse and enrich
+    # parse for real reply already done in enrich_sync_result, but we also want to return parsed reply directly
+    raw_out = result.get("stdout", "") + "\n" + result.get("stderr", "")
+    parsed = _parse_opencode_json_events(raw_out)
+    if parsed.get("reply"):
+        # keep original JSONL in result before overwrite? run_command already truncated
+        # We'll set stdout to parsed reply plus keep raw if needed
+        pass
+    enrich_sync_result("opencode", result, meta)
+    return tool_response(result)
+
+
+def launch_opencode(args: dict[str, Any]) -> dict[str, Any]:
+    command, prompt, cwd, timeout_seconds, meta = build_opencode_command(args, background=True)
+    # For opencode, prompt is part of command, not stdin
+    return tool_response(launch_command("opencode", command, None, cwd, timeout_seconds, meta=meta, task=optional_str(args, "prompt")))
+
+
+def continue_opencode_agent(args: dict[str, Any]) -> dict[str, Any]:
+    """Interject into a previously launched opencode job by resuming its session.
+
+    Opencode resumes via `opencode run --session <id> --format json <prompt>`
+    """
+    enforce_depth()
+    job_id = require_str(args, "job_id")
+    prompt = require_str(args, "prompt")
+    job = get_job(job_id)
+    if job.kind != "opencode":
+        raise ValueError(f"continue_opencode_agent only works on opencode jobs; job {job_id} is {job.kind}")
+
+    _maybe_enrich(job)
+    with job.lock:
+        session_id = job.session_id
+        job_cwd = job.cwd
+        running = job.returncode is None
+        job_model = job.model
+    if running:
+        raise ValueError(
+            "this opencode job is still running; resuming a live session would race. "
+            "Wait for it to finish, then continue_opencode_agent."
+        )
+    if not session_id:
+        raise ValueError(
+            "no session id for this opencode job - it may not have produced JSON output yet. "
+            "Relaunch or check agent_result for raw output."
+        )
+
+    timeout_seconds = optional_int(args, "timeout_seconds", 600, 1, 24 * 60 * 60)
+    max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
+    opencode_bin = os.environ.get("OPENCODE_BIN", "opencode")
+    model = optional_str(args, "model") or job_model
+    variant = optional_str(args, "variant")
+    extra_args = optional_string_list(args, "extra_args")
+
+    command = [
+        opencode_bin,
+        "run",
+        "--format",
+        "json",
+        "--session",
+        session_id,
+        "--dir",
+        job_cwd,
+    ]
+    if model:
+        command.extend(["--model", model])
+    if variant:
+        command.extend(["--variant", variant])
+    command.extend(extra_args)
+    command.append(prompt)
+
+    started_at = time.time()
+    completed = subprocess.run(
+        command,
+        cwd=job_cwd,
+        env=child_env("opencode"),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+    elapsed = round(time.time() - started_at, 3)
+    # One more turn on a warm agent: keeps it near the top of warm_agents and
+    # feeds the staleness/crowding verdicts there.
+    note_reuse(job)
+    parsed = _parse_opencode_json_events(completed.stdout + "\n" + completed.stderr)
+
+    # Refresh parent job token totals
+    try:
+        if parsed.get("usage"):
+            usage = parsed["usage"]
+            norm = {
+                "input_tokens": usage.get("input") or 0,
+                "output_tokens": usage.get("output") or 0,
+                "total_tokens": usage.get("total") or 0,
+                "reasoning_output_tokens": usage.get("reasoning") or 0,
+            }
+            with job.lock:
+                # Accumulate? For simplicity replace with latest cumulative? Actually opencode returns per-turn.
+                # We'll sum if existing tokens exist.
+                existing = job.tokens or {}
+                merged = {
+                    "input_tokens": (existing.get("input_tokens") or 0) + norm.get("input_tokens", 0),
+                    "output_tokens": (existing.get("output_tokens") or 0) + norm.get("output_tokens", 0),
+                    "total_tokens": (existing.get("total_tokens") or 0) + norm.get("total_tokens", 0),
+                    "reasoning_output_tokens": (existing.get("reasoning_output_tokens") or 0) + norm.get("reasoning_output_tokens", 0),
+                }
+                job.tokens = merged
+    except Exception:
+        pass
+
+    result = {
+        "job_id": job_id,
+        "session_id": session_id,
+        "status": "succeeded" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "elapsed_seconds": elapsed,
+        "model": model,
+        "reply": truncate_text(parsed.get("reply") or "", max_output_chars),
+        "turn_tokens": parsed.get("usage"),
+        "resume_command": f"opencode run --session {session_id}",
+    }
+    if completed.returncode != 0:
+        result["stderr"] = truncate_text(completed.stderr, max_output_chars)
+    return tool_response(result)
+
+
+def run_kimi(args: dict[str, Any]) -> dict[str, Any]:
+    command, prompt, cwd, timeout_seconds, meta = build_kimi_command(args)
+    enforce_delegation("kimi", meta.get("model"))
+    max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
+    result = run_command("kimi", command, None, cwd, timeout_seconds, max_output_chars)
+    enrich_sync_result("kimi", result, meta)
+    return tool_response(result)
+
+
+def launch_kimi(args: dict[str, Any]) -> dict[str, Any]:
+    command, prompt, cwd, timeout_seconds, meta = build_kimi_command(args, background=True)
+    return tool_response(launch_command("kimi", command, None, cwd, timeout_seconds, meta=meta, task=optional_str(args, "prompt")))
+
+
+def continue_kimi_agent(args: dict[str, Any]) -> dict[str, Any]:
+    """Interject into a previously launched kimi job by resuming its session.
+
+    Kimi resumes via `kimi --session <id> -p <prompt> --output-format stream-json`
+    """
+    enforce_depth()
+    job_id = require_str(args, "job_id")
+    prompt = require_str(args, "prompt")
+    job = get_job(job_id)
+    if job.kind != "kimi":
+        raise ValueError(f"continue_kimi_agent only works on kimi jobs; job {job_id} is {job.kind}")
+
+    _maybe_enrich(job)
+    with job.lock:
+        session_id = job.session_id
+        job_cwd = job.cwd
+        running = job.returncode is None
+        job_model = job.model
+
+    if running:
+        raise ValueError(
+            "this kimi job is still running; resuming a live session would race. "
+            "Wait for it to finish, then continue_kimi_agent."
+        )
+    if not session_id:
+        raise ValueError(
+            "no session id for this kimi job - it may not have produced one yet. "
+            "Check agent_result for raw output or try again."
+        )
+
+    timeout_seconds = optional_int(args, "timeout_seconds", 600, 1, 24 * 60 * 60)
+    max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
+    kimi_bin = os.environ.get("KIMI_BIN") or os.environ.get("KIMI_CODE_BIN")
+    if not kimi_bin:
+        default_path = Path("~/.kimi-code/bin/kimi").expanduser()
+        kimi_bin = str(default_path) if default_path.exists() else "kimi"
+    model = optional_str(args, "model") or job_model
+    extra_args = optional_string_list(args, "extra_args")
+
+    command = [kimi_bin]
+    if model:
+        command.extend(["-m", model])
+    command.extend(["--session", session_id, "-p", prompt, "--output-format", "stream-json"])
+    command.extend(extra_args)
+
+    started_at = time.time()
+    completed = subprocess.run(
+        command,
+        cwd=job_cwd,
+        env=child_env("kimi"),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+    elapsed = round(time.time() - started_at, 3)
+    # One more turn on a warm agent: keeps it near the top of warm_agents and
+    # feeds the staleness/crowding verdicts there.
+    note_reuse(job)
+    parsed = _parse_kimi_stream_json(completed.stdout + "\n" + completed.stderr)
+
+    try:
+        if parsed.get("usage"):
+            usage = parsed["usage"]
+            norm = {
+                "input_tokens": usage.get("input") or usage.get("input_tokens") or 0,
+                "output_tokens": usage.get("output") or usage.get("output_tokens") or 0,
+                "total_tokens": usage.get("total") or usage.get("total_tokens") or (usage.get("input", 0) + usage.get("output", 0)),
+            }
+            with job.lock:
+                existing = job.tokens or {}
+                merged = {
+                    "input_tokens": (existing.get("input_tokens") or 0) + norm.get("input_tokens", 0),
+                    "output_tokens": (existing.get("output_tokens") or 0) + norm.get("output_tokens", 0),
+                    "total_tokens": (existing.get("total_tokens") or 0) + norm.get("total_tokens", 0),
+                }
+                job.tokens = merged
+    except Exception:
+        pass
+
+    result = {
+        "job_id": job_id,
+        "session_id": session_id,
+        "status": "succeeded" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "elapsed_seconds": elapsed,
+        "model": model,
+        "reply": truncate_text(parsed.get("reply") or "", max_output_chars),
+        "turn_tokens": parsed.get("usage"),
+        "resume_command": f"{kimi_bin} --session {session_id} -p <prompt>",
+    }
+    if completed.returncode != 0:
+        result["stderr"] = truncate_text(completed.stderr, max_output_chars)
+    return tool_response(result)
+
+
+def run_grok(args: dict[str, Any]) -> dict[str, Any]:
+    command, prompt, cwd, timeout_seconds, meta = build_grok_command(args)
+    enforce_delegation("grok", meta.get("model"))
+    max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
+    result = run_command("grok", command, None, cwd, timeout_seconds, max_output_chars)
+    enrich_sync_result("grok", result, meta)
+    return tool_response(result)
+
+
+def launch_grok(args: dict[str, Any]) -> dict[str, Any]:
+    command, prompt, cwd, timeout_seconds, meta = build_grok_command(args, background=True)
+    return tool_response(launch_command("grok", command, None, cwd, timeout_seconds, meta=meta, task=optional_str(args, "prompt")))
+
+
+def continue_grok_agent(args: dict[str, Any]) -> dict[str, Any]:
+    """Resume a Grok session: grok --resume <id> -p <prompt> --output-format json"""
+    enforce_depth()
+    job_id = require_str(args, "job_id")
+    prompt = require_str(args, "prompt")
+    job = get_job(job_id)
+    if job.kind != "grok":
+        raise ValueError(f"continue_grok_agent only works on grok jobs; job {job_id} is {job.kind}")
+
+    _maybe_enrich(job)
+    with job.lock:
+        session_id = job.session_id
+        job_cwd = job.cwd
+        running = job.returncode is None
+        job_model = job.model
+
+    if running:
+        raise ValueError(
+            "this grok job is still running; resuming live would race. Wait then continue."
+        )
+    if not session_id:
+        raise ValueError("no session id for this grok job - check agent_result")
+
+    timeout_seconds = optional_int(args, "timeout_seconds", 600, 1, 24 * 60 * 60)
+    max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
+    grok_bin = os.environ.get("GROK_BIN") or "/Users/devonedwards/.local/bin/grok"
+    if not Path(grok_bin).exists():
+        grok_bin = "grok"
+    model = optional_str(args, "model") or job_model
+    extra_args = optional_string_list(args, "extra_args")
+
+    command = [grok_bin, "--resume", session_id, "-p", prompt, "--output-format", "json"]
+    if model:
+        command.extend(["-m", model])
+    command.extend(["--cwd", job_cwd])
+    command.extend(extra_args)
+
+    started_at = time.time()
+    completed = subprocess.run(
+        command,
+        cwd=job_cwd,
+        env=child_env("grok"),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+    elapsed = round(time.time() - started_at, 3)
+    # One more turn on a warm agent: keeps it near the top of warm_agents and
+    # feeds the staleness/crowding verdicts there.
+    note_reuse(job)
+    parsed = _parse_grok_json(completed.stdout + "\n" + completed.stderr)
+
+    try:
+        if parsed.get("usage"):
+            usage = parsed["usage"]
+            norm = {
+                "input_tokens": usage.get("input_tokens") or usage.get("input") or 0,
+                "output_tokens": usage.get("output_tokens") or usage.get("output") or 0,
+                "total_tokens": usage.get("total_tokens") or usage.get("total") or 0,
+            }
+            with job.lock:
+                existing = job.tokens or {}
+                merged = {
+                    "input_tokens": (existing.get("input_tokens") or 0) + norm.get("input_tokens", 0),
+                    "output_tokens": (existing.get("output_tokens") or 0) + norm.get("output_tokens", 0),
+                    "total_tokens": (existing.get("total_tokens") or 0) + norm.get("total_tokens", 0),
+                }
+                job.tokens = merged
+    except Exception:
+        pass
+
+    result = {
+        "job_id": job_id,
+        "session_id": session_id,
+        "status": "succeeded" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "elapsed_seconds": elapsed,
+        "model": model,
+        "reply": truncate_text(parsed.get("reply") or "", max_output_chars),
+        "turn_tokens": parsed.get("usage"),
+        "resume_command": f"{grok_bin} --resume {session_id} -p <prompt>",
+    }
+    if completed.returncode != 0:
+        result["stderr"] = truncate_text(completed.stderr, max_output_chars)
+    return tool_response(result)
 
 
 def _maybe_enrich(job: Job) -> None:
@@ -1884,6 +3366,9 @@ def continue_codex_agent(args: dict[str, Any]) -> dict[str, Any]:
         timeout=timeout_seconds,
     )
     elapsed = round(time.time() - started_at, 3)
+    # One more turn on a warm agent: keeps it near the top of warm_agents and
+    # feeds the staleness/crowding verdicts there.
+    note_reuse(job)
     parsed = _parse_codex_json_events(completed.stdout)
 
     # Refresh the parent job's cumulative token totals from the (now-updated) rollout.
@@ -1984,6 +3469,9 @@ def continue_claude_agent(args: dict[str, Any]) -> dict[str, Any]:
         timeout=timeout_seconds,
     )
     elapsed = round(time.time() - started_at, 3)
+    # One more turn on a warm agent: keeps it near the top of warm_agents and
+    # feeds the staleness/crowding verdicts there.
+    note_reuse(job)
 
     # Refresh the parent job's cumulative token totals from the (now-updated) transcript.
     try:
@@ -2172,6 +3660,147 @@ def _codex_events(entry: dict[str, Any], include_tool_calls: bool) -> list[dict[
     return []
 
 
+def _opencode_events(entry: dict[str, Any], include_tool_calls: bool) -> list[dict[str, Any]]:
+    """Normalize opencode JSON events to peek_agent event format."""
+    out: list[dict[str, Any]] = []
+    etype = entry.get("type")
+    if etype == "text":
+        part = entry.get("part") or {}
+        text = part.get("text") or ""
+        if text.strip():
+            out.append({"kind": "message", "role": "assistant", "text": _summarize(text, 4000)})
+    elif etype == "step_start":
+        out.append({"kind": "status", "text": "step_start"})
+    elif etype == "step_finish":
+        part = entry.get("part") or {}
+        reason = part.get("reason") or "step_finish"
+        out.append({"kind": "status", "text": reason})
+        if include_tool_calls and part.get("tokens"):
+            out.append({"kind": "tool_result", "summary": _summarize(part.get("tokens"))})
+    elif etype == "tool_call":
+        if include_tool_calls:
+            part = entry.get("part") or {}
+            out.append({"kind": "tool_call", "tool": part.get("tool") or etype, "summary": _summarize(part)})
+    elif etype == "tool_result":
+        if include_tool_calls:
+            part = entry.get("part") or {}
+            out.append({"kind": "tool_result", "summary": _summarize(part)})
+    return out
+
+
+def warm_agents(args: dict[str, Any]) -> dict[str, Any]:
+    """List agents that are still resumable, so a warm one can be reused.
+
+    The point of the tool is to make reuse the easy path. A fresh agent starts from
+    nothing: it re-reads the same files, rediscovers the same layout, and re-earns
+    the same corrections before it is as useful as one that already finished a turn
+    on this problem. Where that context is the expensive part, resuming is strictly
+    cheaper than replacing.
+
+    It is not unconditional, though - see roster_verdict. Each entry says whether it
+    is worth resuming and why, so a stale or crowded session can be retired instead
+    of dragged forward past its usefulness.
+    """
+    kind = optional_str(args, "kind")
+    cwd = optional_str(args, "cwd")
+    include_retired = optional_bool(args, "include_retired", False)
+    reusable_only = optional_bool(args, "reusable_only", False)
+    limit = optional_int(args, "limit", 20, 1, 200)
+
+    # Anything running or finished in THIS process may not be on disk yet (the roster
+    # is written when a job finishes), so fold live jobs in rather than miss them.
+    with jobs_lock:
+        live = list(jobs.values())
+    for job in live:
+        save_to_roster(job)
+
+    resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
+    entries: list[dict[str, Any]] = []
+    for record in _iter_roster():
+        if kind and record.get("kind") != kind:
+            continue
+        if resolved_cwd and record.get("cwd") != resolved_cwd:
+            continue
+        if record.get("retired") and not include_retired:
+            continue
+        verdict, why = roster_verdict(record)
+        if reusable_only and verdict != "reuse":
+            continue
+        age_seconds = time.time() - (record.get("last_used_at") or 0)
+        entries.append({
+            "job_id": record.get("job_id"),
+            "kind": record.get("kind"),
+            "model": record.get("model"),
+            "cwd": record.get("cwd"),
+            "task": (record.get("task") or "").strip()[:200],
+            "turns": record.get("turns") or 1,
+            "idle_minutes": round(age_seconds / 60),
+            "last_status": record.get("status"),
+            "tokens": _job_token_summary(record.get("tokens")),
+            "verdict": verdict,
+            "why": why,
+            "continue_with": f"continue_{record.get('kind')}_agent",
+            "concerns": len(concerns_for(record.get("job_id") or "")),
+        })
+        if len(entries) >= limit:
+            break
+
+    reusable = [e for e in entries if e["verdict"] == "reuse"]
+    return tool_response({
+        "count": len(entries),
+        "reusable": len(reusable),
+        "agents": entries,
+        "guidance": (
+            "Prefer resuming an agent whose verdict is 'reuse' over launching a fresh one "
+            "for related work: it already holds the context, so you pay for the new turn "
+            "instead of re-teaching the problem. Match on cwd and on what the task line "
+            "says it was doing - a warm agent pointed at the wrong problem is worse than "
+            "a cold one, because its old framing follows it. Do NOT resume one whose "
+            "verdict is 'stale' or 'crowded' without re-briefing it, and use retire_agent "
+            "on any that has stopped being worth its context."
+            if entries else
+            "No resumable agents on file. Launch a fresh one; it will be recorded here "
+            "when it finishes, so the next related task can resume it instead."
+        ),
+    })
+
+
+def retire_agent(args: dict[str, Any]) -> dict[str, Any]:
+    """Mark a warm agent as no longer worth reusing - the 'to a point' in reuse.
+
+    Reuse has a ceiling: a session can go stale against a moving repo, accumulate so
+    much context that re-reading it costs more than a fresh start, or simply go wrong
+    in a way that would poison whatever it touches next. Retiring is how that gets
+    said out loud, instead of leaving a bad agent at the top of the warm list where
+    its warmth reads as an endorsement.
+
+    The underlying session is untouched - `claude --resume` / `codex resume` still
+    work by hand. This only removes it from what the bridge recommends.
+    """
+    job_id = require_str(args, "job_id")
+    reason = optional_str(args, "reason") or "retired without a stated reason"
+    unretire = optional_bool(args, "unretire", False)
+
+    job = get_job(job_id)
+    with job.lock:
+        job.retired = not unretire
+        job.retired_reason = None if unretire else reason
+    save_to_roster(job)
+    return tool_response({
+        "job_id": job_id,
+        "retired": not unretire,
+        "reason": None if unretire else reason,
+        "note": (
+            "Back in the warm list and available to continue_*."
+            if unretire else
+            "Dropped from warm_agents recommendations. The session itself is untouched - "
+            f"resume it by hand with `{'claude --resume' if job.kind == 'claude' else 'codex resume'} "
+            f"{job.session_id}` if you change your mind, or call retire_agent with "
+            "unretire=true."
+        ),
+    })
+
+
 def peek_agent(args: dict[str, Any]) -> dict[str, Any]:
     """Read what a subagent has done so far, from its own transcript, without waiting."""
     job_id = require_str(args, "job_id")
@@ -2183,6 +3812,100 @@ def peek_agent(args: dict[str, Any]) -> dict[str, Any]:
 
     with job.lock:
         kind, status, session_id = job.kind, job.status, job.session_id
+
+    # Opencode/Kimi/Grok have no live transcript file; but after finish we have stdout JSONL
+    if kind in ("opencode", "kimi", "grok"):
+        with job.lock:
+            raw = job.stdout or ""
+        if not raw:
+            return tool_response({
+                "job_id": job_id, "status": status, "events": [], "cursor": since,
+                "note": (
+                    f"{kind} job has no stdout yet (still starting) - retry shortly. "
+                    f"Note: {kind} does not write an incremental transcript file, so live peek "
+                    "is limited; after finish, agent_result will have full output."
+                ),
+            })
+        events: list[dict[str, Any]] = []
+        line_no = 0
+        # Choose parser based on kind
+        def parse_line(entry_dict, inc, k=kind):
+            if k == "opencode":
+                return _opencode_events(entry_dict, inc)
+            elif k == "grok":
+                out = []
+                txt = entry_dict.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    out.append({"kind": "message", "role": "assistant", "text": _summarize(txt, 4000)})
+                # streaming-json or other shapes
+                if entry_dict.get("role") == "assistant":
+                    content = entry_dict.get("content")
+                    if isinstance(content, str) and content.strip():
+                        out.append({"kind": "message", "role": "assistant", "text": _summarize(content, 4000)})
+                if inc and entry_dict.get("tool_calls"):
+                    for tc in entry_dict.get("tool_calls", []):
+                        name = (tc.get("function") or {}).get("name") or tc.get("name") or "tool"
+                        out.append({"kind": "tool_call", "tool": name, "summary": _summarize(tc)})
+                return out
+            else:
+                # kimi and generic
+                out = []
+                if entry_dict.get("role") == "assistant":
+                    content = entry_dict.get("content")
+                    if isinstance(content, str) and content.strip():
+                        out.append({"kind": "message", "role": "assistant", "text": _summarize(content, 4000)})
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict):
+                                t = item.get("text") or item.get("content")
+                                if t:
+                                    out.append({"kind": "message", "role": "assistant", "text": _summarize(t, 4000)})
+                if inc and entry_dict.get("tool_calls"):
+                    for tc in entry_dict["tool_calls"]:
+                        name = (tc.get("function") or {}).get("name") or tc.get("name") or "tool"
+                        out.append({"kind": "tool_call", "tool": name, "summary": _summarize(tc)})
+                return out
+
+        for line_no, line in enumerate(raw.splitlines(), start=1):
+            if line_no <= since:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                # plain text fallback
+                if line.strip():
+                    events.append({"kind": "message", "role": "assistant", "text": _summarize(line, 4000), "line": line_no})
+                continue
+            if kind == "opencode":
+                parsed = _opencode_events(entry, include_tool_calls)
+            else:
+                parsed = parse_line(entry, include_tool_calls, kind)
+                # also try opencode parser as fallback
+                if not parsed:
+                    parsed = _opencode_events(entry, include_tool_calls)
+                # and grok json fallback
+                if not parsed and kind == "grok" and entry.get("text"):
+                    parsed = [{"kind": "message", "role": "assistant", "text": _summarize(entry.get("text"), 4000)}]
+            for ev in parsed:
+                ev["line"] = line_no
+            events.extend(parsed)
+        truncated = len(events) > limit
+        if truncated:
+            events = events[-limit:]
+        return tool_response({
+            "job_id": job_id,
+            "kind": kind,
+            "status": status,
+            "session_id": session_id,
+            "transcript": f"{kind} stdout JSONL (no file)",
+            "events": events,
+            "event_count": len(events),
+            "truncated_older": truncated,
+            "cursor": line_no,
+        })
 
     path = _resolve_transcript(job)
     if path is None:
@@ -2682,12 +4405,23 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "launch_codex_agent": launch_codex,
     "run_claude_agent": run_claude,
     "launch_claude_agent": launch_claude,
+    "run_opencode_agent": run_opencode,
+    "launch_opencode_agent": launch_opencode,
+    "run_kimi_agent": run_kimi,
+    "launch_kimi_agent": launch_kimi,
+    "run_grok_agent": run_grok,
+    "launch_grok_agent": launch_grok,
     "agent_status": agent_status,
     "agent_result": agent_result,
     "cancel_agent": cancel_agent,
     "continue_codex_agent": continue_codex_agent,
     "continue_claude_agent": continue_claude_agent,
+    "continue_opencode_agent": continue_opencode_agent,
+    "continue_kimi_agent": continue_kimi_agent,
+    "continue_grok_agent": continue_grok_agent,
     "peek_agent": peek_agent,
+    "warm_agents": warm_agents,
+    "retire_agent": retire_agent,
     "ask_parent": ask_parent,
     "pending_questions": pending_questions,
     "answer_agent": answer_agent,
@@ -2870,6 +4604,89 @@ def tool_schema() -> list[dict[str, Any]]:
         "properties": claude_props,
     }
 
+    opencode_props = dict(prompt_schema["properties"])
+    opencode_props["model"] = {
+        "type": "string",
+        "description": (
+            "Optional model override in provider/model format (e.g. meta/muse-spark-1.1, "
+            "opencode/big-pickle, anthropic/claude-opus-4). Opencode supports many providers. "
+            "Use a lighter/cheaper model for simple tasks."
+        ),
+    }
+    opencode_props.update(
+        {
+            "variant": {
+                "type": "string",
+                "description": "Optional model variant (reasoning effort: high, low, minimal, etc).",
+            },
+            "agent": {
+                "type": "string",
+                "description": "Optional opencode agent name to use.",
+            },
+            "output_format": {
+                "type": "string",
+                "enum": ["json", "default"],
+                "default": "json",
+                "description": "Output format. json gives structured events + tokens; default is formatted text.",
+            },
+        }
+    )
+    opencode_schema = {
+        **prompt_schema,
+        "properties": opencode_props,
+    }
+
+    kimi_props = dict(prompt_schema["properties"])
+    kimi_props["model"] = {
+        "type": "string",
+        "description": (
+            "Optional model alias (e.g. kimi-code/k3, kimi-code/kimi-for-coding, kimi-code/kimi-k2.5). "
+            "Defined in ~/.kimi-code/config.toml models table. Use cheaper model for bulk work."
+        ),
+    }
+    kimi_props.update(
+        {
+            "output_format": {
+                "type": "string",
+                "enum": ["stream-json", "text"],
+                "default": "stream-json",
+                "description": "Output format. stream-json gives structured events; text is plain transcript.",
+            },
+            "yolo": {
+                "type": "boolean",
+                "default": True,
+                "description": "Auto-approve (kimi -p runs in auto).",
+            },
+        }
+    )
+    kimi_schema = {
+        **prompt_schema,
+        "properties": kimi_props,
+    }
+
+    grok_props = dict(prompt_schema["properties"])
+    grok_props["model"] = {
+        "type": "string",
+        "description": (
+            "Optional model ID (e.g. grok-4.5, grok-4, grok-3). Available from `grok models`. "
+            "Use default or cheaper variant for bulk work."
+        ),
+    }
+    grok_props.update(
+        {
+            "output_format": {
+                "type": "string",
+                "enum": ["json", "plain", "streaming-json"],
+                "default": "json",
+                "description": "Output format for grok -p. json gives structured reply + tokens.",
+            },
+        }
+    )
+    grok_schema = {
+        **prompt_schema,
+        "properties": grok_props,
+    }
+
     return [
         {
             "name": "run_codex_agent",
@@ -2890,6 +4707,36 @@ def tool_schema() -> list[dict[str, Any]]:
             "name": "launch_claude_agent",
             "description": "Launch Claude Code in the background via `claude --print`; poll with agent_status and agent_result.",
             "inputSchema": claude_schema,
+        },
+        {
+            "name": "run_opencode_agent",
+            "description": "Run Opencode non-interactively via `opencode run` and wait for completion. Model param uses provider/model format (e.g. meta/muse-spark-1.1, opencode/big-pickle, anthropic/claude-sonnet-4).",
+            "inputSchema": opencode_schema,
+        },
+        {
+            "name": "launch_opencode_agent",
+            "description": "Launch Opencode in the background via `opencode run`; poll with agent_status and agent_result. Supports model selection via provider/model.",
+            "inputSchema": opencode_schema,
+        },
+        {
+            "name": "run_kimi_agent",
+            "description": "Run Kimi Code non-interactively via `kimi -p` and wait. Model alias from config (e.g. kimi-code/k3, kimi-code/kimi-for-coding). Needs provider configured or login.",
+            "inputSchema": kimi_schema,
+        },
+        {
+            "name": "launch_kimi_agent",
+            "description": "Launch Kimi Code in background via `kimi -p`; poll with agent_status and agent_result. Supports model selection.",
+            "inputSchema": kimi_schema,
+        },
+        {
+            "name": "run_grok_agent",
+            "description": "Run Grok Code non-interactively via `grok -p` and wait. Model ID like grok-4.5. Grok must be logged in (`grok login`).",
+            "inputSchema": grok_schema,
+        },
+        {
+            "name": "launch_grok_agent",
+            "description": "Launch Grok Code in background via `grok -p`; poll with agent_status and agent_result. Model selection via -m.",
+            "inputSchema": grok_schema,
         },
         {
             "name": "agent_status",
@@ -3001,6 +4848,98 @@ def tool_schema() -> list[dict[str, Any]]:
                             "ungated (no approval for edits or commands) - use deliberately."
                         ),
                     },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 86400,
+                        "default": 600,
+                    },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 2000000,
+                        "default": DEFAULT_MAX_OUTPUT_CHARS,
+                    },
+                },
+                "required": ["job_id", "prompt"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "continue_opencode_agent",
+            "description": (
+                "Interject into a previously launched opencode job by resuming its session and "
+                "sending a follow-up prompt (`opencode run --session <id>`). Returns the agent's "
+                "reply plus token usage. Requires the job to be finished - resuming live would race. "
+                "Model can be overridden per turn using provider/model format (e.g. meta/muse-spark-1.1)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The launched opencode job to continue."},
+                    "prompt": {"type": "string", "description": "Follow-up message to send into the session."},
+                    "model": {"type": "string", "description": "Optional model override for this turn (provider/model)."},
+                    "variant": {"type": "string", "description": "Optional model variant (reasoning effort)."},
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 86400,
+                        "default": 600,
+                    },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 2000000,
+                        "default": DEFAULT_MAX_OUTPUT_CHARS,
+                    },
+                },
+                "required": ["job_id", "prompt"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "continue_kimi_agent",
+            "description": (
+                "Interject into a previously launched kimi job by resuming its session and "
+                "sending a follow-up prompt (`kimi --session <id> -p <prompt>`). Returns the agent's "
+                "reply plus token usage. Requires finished job."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The launched kimi job to continue."},
+                    "prompt": {"type": "string", "description": "Follow-up message to send into the session."},
+                    "model": {"type": "string", "description": "Optional model alias override for this turn."},
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 86400,
+                        "default": 600,
+                    },
+                    "max_output_chars": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 2000000,
+                        "default": DEFAULT_MAX_OUTPUT_CHARS,
+                    },
+                },
+                "required": ["job_id", "prompt"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "continue_grok_agent",
+            "description": (
+                "Interject into a previously launched grok job by resuming its session and "
+                "sending a follow-up prompt (`grok --resume <id> -p <prompt>`). Returns the agent's "
+                "reply plus token usage. Requires finished job."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The launched grok job to continue."},
+                    "prompt": {"type": "string", "description": "Follow-up message to send into the session."},
+                    "model": {"type": "string", "description": "Optional model override for this turn."},
                     "timeout_seconds": {
                         "type": "integer",
                         "minimum": 1,
@@ -3196,6 +5135,74 @@ def tool_schema() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["concern"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "warm_agents",
+            "description": (
+                "List agents whose sessions are still resumable, with a per-agent verdict on "
+                "whether reusing one beats launching a fresh one. CHECK THIS BEFORE launching "
+                "an agent for work related to something already done: a warm agent has already "
+                "read the files, learned the layout, and had its wrong assumptions corrected, "
+                "and a new agent has to pay for all of that again in tokens and wall-clock to "
+                "get back to where the last one already was. Survives a server restart - the "
+                "sessions live on disk, not in this process. Reuse is bounded, though: entries "
+                "come back marked 'reuse', 'stale' (idle too long, its picture of the repo may "
+                "be wrong), 'crowded' (so much context that re-reading it costs more than "
+                "starting over), 'suspect' (last run failed), or 'retired'. Resume with the "
+                "continue_* tool named in each entry."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["codex", "claude", "opencode", "kimi", "grok"],
+                        "description": "Optional: only agents of this client.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": (
+                            "Optional: only agents that worked in this directory. The strongest "
+                            "signal that a warm agent's context is relevant to your task."
+                        ),
+                    },
+                    "reusable_only": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Only agents whose verdict is 'reuse'.",
+                    },
+                    "include_retired": {"type": "boolean", "default": False},
+                    "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "retire_agent",
+            "description": (
+                "Mark a warm agent as no longer worth reusing, so warm_agents stops "
+                "recommending it. Use it when a session has gone stale against a changed "
+                "repo, has accumulated more context than it is worth, or produced work you "
+                "do not trust - leaving a bad agent at the top of the warm list makes its "
+                "warmth read as an endorsement. The session itself is untouched and can "
+                "still be resumed by hand. Pass unretire=true to undo."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Why it is being retired. Worth stating - a future reader "
+                            "deciding whether to resume it will want to know."
+                        ),
+                    },
+                    "unretire": {"type": "boolean", "default": False},
+                },
+                "required": ["job_id"],
                 "additionalProperties": False,
             },
         },

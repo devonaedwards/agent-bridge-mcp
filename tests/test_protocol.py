@@ -222,7 +222,7 @@ def test_supervision_notes() -> None:
 
 
 def test_delegation() -> None:
-    print("\ndelegation to cheaper models")
+    print("\ndelegation: downward and sideways")
     import os
     check("codex ladder is most-capable-first", ab.codex_model_tiers()[0].endswith("sol"),
           "cache order IS the capability order: sol > terra > luna")
@@ -230,6 +230,26 @@ def test_delegation() -> None:
           ab.model_rank("claude", "claude-opus-4-8") < ab.model_rank("claude", "claude-haiku-4-5"))
     check("context-window suffix is stripped",
           ab.model_rank("claude", "claude-opus-4-8[1m]") == ab.model_rank("claude", "claude-opus-4-8"))
+    check("current opus is on the ladder", ab.model_rank("claude", "claude-opus-5[1m]") is not None,
+          "a frontier model missing from the ladder silently skips the direction check")
+
+    # Capability classes are what make two vendors' ladders comparable at all.
+    cls = ab.capability_class
+    check("sol and opus are the same class", cls("gpt-5.6-sol") == cls("claude-opus-5"))
+    check("fable outranks the frontier class", cls("claude-fable-5") < cls("claude-opus-5"))
+    check("sonnet sits below opus", cls("claude-sonnet-5") > cls("claude-opus-5"))
+    check("haiku is the light class",
+          cls("claude-haiku-4-5") == ab.CAPABILITY_CLASSES.index("light"))
+    for model, want in (("grok-3-mini", "light"), ("gpt-5.4-mini", "light"),
+                        ("kimi-code/kimi-for-coding-highspeed", "light"),
+                        ("opencode/north-mini-code-free", "light")):
+        check(f"{model} classes as {want}", cls(model) == ab.CAPABILITY_CLASSES.index(want),
+              "pattern order must not let a cheap variant inherit its family's class")
+    check("unknown vendor model is unclassed", cls("totally-made-up-9000") is None)
+    check("sol <-> opus are declared peers",
+          ab.are_peers("gpt-5.6-sol", "claude-opus-5")
+          and ab.are_peers("claude-opus-5[1m]", "gpt-5.6-sol"),
+          "the pairing must hold in BOTH directions")
 
     saved = {k: os.environ.get(k) for k in
              ("AGENT_BRIDGE_JOB_ID", "AGENT_BRIDGE_MODEL", "AGENT_BRIDGE_PARENT")}
@@ -239,20 +259,54 @@ def test_delegation() -> None:
         ab.enforce_delegation("claude", "claude-opus-4-8")
         check("top-level launches are unrestricted", True)
 
-        os.environ.update({"AGENT_BRIDGE_JOB_ID": "J", "AGENT_BRIDGE_MODEL": "claude-sonnet-5",
+        # An Opus subagent: may go sideways to Sol or to another frontier model,
+        # down to sonnet/haiku, but not up to fable.
+        os.environ.update({"AGENT_BRIDGE_JOB_ID": "J", "AGENT_BRIDGE_MODEL": "claude-opus-5[1m]",
                            "AGENT_BRIDGE_PARENT": "claude"})
-        ab._helpers_launched = 0
-        for label, model in (("upward", "claude-opus-4-8"), ("sideways", "claude-sonnet-5")):
+        for label, kind, model in (("sideways to Sol", "codex", "gpt-5.6-sol"),
+                                   ("sideways to a peer opus", "claude", "claude-opus-4-8"),
+                                   ("downward to sonnet", "claude", "claude-sonnet-5"),
+                                   ("downward to haiku", "claude", "claude-haiku-4-5")):
+            ab._helpers_launched = 0
             try:
-                ab.enforce_delegation("claude", model)
-                check(f"subagent blocked from delegating {label}", False, "allowed")
-            except RuntimeError as exc:
-                check(f"subagent blocked from delegating {label}", "DOWNWARD" in str(exc))
+                ab.enforce_delegation(kind, model)
+                check(f"opus may delegate {label}", True)
+            except (RuntimeError, ValueError) as exc:
+                check(f"opus may delegate {label}", False, str(exc))
+        ab._helpers_launched = 0
+        try:
+            ab.enforce_delegation("claude", "claude-fable-5")
+            check("opus blocked from delegating upward", False, "allowed")
+        except RuntimeError as exc:
+            check("opus blocked from delegating upward", "not upward" in str(exc))
+
+        # And the reverse pairing: Sol may hand work to Opus.
+        os.environ.update({"AGENT_BRIDGE_MODEL": "gpt-5.6-sol", "AGENT_BRIDGE_PARENT": "codex"})
+        ab._helpers_launched = 0
+        try:
+            ab.enforce_delegation("claude", "claude-opus-5")
+            check("Sol may delegate sideways to Opus", True)
+        except (RuntimeError, ValueError) as exc:
+            check("Sol may delegate sideways to Opus", False, str(exc))
+        ab._helpers_launched = 0
+        try:
+            ab.enforce_delegation("claude", "claude-fable-5")
+            check("Sol still blocked from delegating upward", False, "allowed")
+        except RuntimeError as exc:
+            check("Sol still blocked from delegating upward", "not upward" in str(exc))
+
+        os.environ["AGENT_BRIDGE_MODEL"] = "claude-sonnet-5"
+        ab._helpers_launched = 0
         try:
             ab.enforce_delegation("claude", None)
             check("subagent must name a model", False, "allowed")
         except ValueError:
             check("subagent must name a model", True)
+        try:
+            ab.enforce_delegation("claude", "definitely-not-a-model")
+            check("unknown model refused", False, "allowed")
+        except ValueError as exc:
+            check("unknown model refused", "unknown model" in str(exc))
 
         ab._helpers_launched = 0
         ab.enforce_delegation("claude", "claude-haiku-4-5")
@@ -265,7 +319,9 @@ def test_delegation() -> None:
             check("third helper blocked", "limit reached" in str(exc))
 
         rendered = ab.with_ask_parent_preamble("task")
-        check("preamble offers delegation", "cheaper model" in rendered.lower())
+        check("preamble offers cheaper delegation", "cheaper model" in rendered.lower())
+        check("preamble offers sideways delegation", "SIDEWAYS" in rendered)
+        check("preamble still forbids upward", "may NOT do is delegate" in rendered)
         check("preamble keeps accountability", "responsible for the work" in rendered)
     finally:
         ab._helpers_launched = 0
@@ -274,6 +330,43 @@ def test_delegation() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_report_channel_always_allowed() -> None:
+    print("\nreport channel is never gated")
+    import os
+    args = {"prompt": "p", "cwd": str(REPO)}
+    cmd, *_ = ab.build_claude_command(dict(args), background=True)
+    joined = " ".join(cmd)
+    for tool in ab.REPORT_CHANNEL_TOOLS:
+        check(f"{tool.split('__')[-1]} allowed with no caller allowlist", tool in joined,
+              "a sandboxed child must be able to report instead of timing out silently")
+
+    cmd, *_ = ab.build_claude_command(
+        dict(args, allowed_tools=["Read"]), background=True)
+    joined = " ".join(cmd)
+    check("caller allowlist is preserved", "Read" in joined)
+    check("report channel added to caller allowlist", ab.ASK_PARENT_TOOL in joined)
+
+    # A denylist beats an allowlist, so the denied entry has to be dropped outright.
+    cmd, *_ = ab.build_claude_command(
+        dict(args, disallowed_tools=["Bash", ab.ASK_PARENT_TOOL]), background=True)
+    flags = dict(zip(cmd, cmd[1:]))
+    check("caller denylist is otherwise honored", "Bash" in flags.get("--disallowedTools", ""))
+    check("report channel stripped from denylist",
+          ab.ASK_PARENT_TOOL not in flags.get("--disallowedTools", ""))
+    check("report channel still allowed despite denylist",
+          ab.ASK_PARENT_TOOL in flags.get("--allowedTools", ""))
+
+    # Synchronous run_* jobs get no job id, so ask_parent is inert there by design.
+    cmd, *_ = ab.build_claude_command(dict(args), background=False)
+    check("foreground runs are left alone", ab.ASK_PARENT_TOOL not in " ".join(cmd),
+          "a blocking question to a parent that is itself blocked would deadlock")
+
+    if Path(ab.build_grok_command({"prompt": "p", "cwd": str(REPO)})[0][0]).exists():
+        cmd, *_ = ab.build_grok_command({"prompt": "p", "cwd": str(REPO)}, background=True)
+        check("grok background launch allows ask_parent",
+              "ask_parent" in " ".join(cmd) and "--allow" in cmd)
 
 
 def test_concerns() -> None:
@@ -365,7 +458,7 @@ def test_preamble_gating_sections() -> None:
         check("minimal is materially smaller", len(small) < len(big) * 0.7)
         for name in ab.PREAMBLE_ORDER:
             rendered = ab.PREAMBLE_SECTIONS[name].format(
-                tool="T", notes_tool="N", concern_tool="C", max_helpers=2)
+                tool="T", notes_tool="N", concern_tool="C", warm_tool="W", max_helpers=2)
             check(f"section '{name}' renders with no stray placeholder", "{" not in rendered)
 
         cmd_args = {"prompt": "t", "cwd": "/tmp", "multi_phase": False}
@@ -428,6 +521,7 @@ if __name__ == "__main__":
     test_escalation()
     test_supervision_notes()
     test_delegation()
+    test_report_channel_always_allowed()
     test_concerns()
     test_preamble_gating_sections()
     test_on_timeout_schema()

@@ -102,28 +102,61 @@ The distinction from `ask_parent` matters: a question blocks because the agent n
 answer to continue. A concern does not. An agent that cannot safely proceed should ask,
 with `on_timeout="abort"`.
 
-## Delegating drudgery to a cheaper model
+## Delegating: downward and sideways
 
-A subagent can hand its own toil to a cheaper model - bulk mechanical edits, log
-scanning, reformatting - by launching helpers of its own:
+A subagent can launch helpers of its own - either **downward** to a cheaper model for
+toil (bulk mechanical edits, log scanning, reformatting) or **sideways** to a peer at
+its own level for an independent look (a second opinion on a design call, an
+adversarial read of a shaky conclusion):
 
-- It may only delegate **downward**: strictly lower on the capability ladder than the
-  model it is running. Upward or sideways is refused, so the affordance can't route real
-  work back to a frontier model.
-- It must **name the model** explicitly; an unnamed or unknown model is refused.
+- **Downward or sideways only.** Upward is refused - it is escalation dressed as
+  offloading, and `escalate_question` / `ask_parent` is the honest way to do that.
+- It must **name the model** explicitly; an unnamed model is refused, and so is one
+  unknown to both the ladder and the capability-class table.
 - At most **2 helpers** per subagent (`AGENT_BRIDGE_MAX_HELPERS` to change).
 - Top-level launches (yours) are unrestricted - the limits apply only to subagents.
 
 The delegating agent stays responsible for the result, including anything a helper got
-wrong, and is told so.
+wrong, and is told so. A peer's disagreement is evidence to weigh, not a verdict that
+overrides it.
 
-Ladders, most capable first. Codex's is read from `~/.codex/models_cache.json`, which
-already lists models in descending capability, so it tracks the lineup automatically:
+**Sideways is why the bridge exists.** Codex/Sol and Claude/Opus are declared peers in
+both directions, so either can ask the other to review its work:
 
 ```
-claude: fable-5 > opus-4-8 > opus-4-7 > opus-4-6 > sonnet-5 > sonnet-4-6 > haiku-4-5
-codex:  gpt-5.6-sol > gpt-5.6-terra > gpt-5.6-luna > gpt-5.5 > gpt-5.4 > gpt-5.4-mini
+sol -> opus     allowed (peers)
+opus -> sol     allowed (peers)
+opus -> haiku   allowed (downward)
+opus -> fable   refused (apex is a more capable class)
+sonnet -> sol   refused (frontier is a more capable class)
 ```
+
+Direction comes from cross-vendor **capability class** (`apex > frontier > workhorse >
+light`), not ladder position - two vendors' ladder indices aren't comparable, and
+treating them as if they were is what used to block every peer handoff. Class tables
+and the per-vendor ladders are in `agent_bridge_mcp.py`; codex's ladder is read from
+`~/.codex/models_cache.json`, which already lists models in descending capability, so
+it tracks the lineup automatically.
+
+## Reusing a warm agent instead of launching a fresh one
+
+`warm_agents` lists agents whose sessions are still resumable. Check it before
+launching anything for related work: an agent that already worked the problem holds
+context you would otherwise pay to rebuild, and `continue_*_agent` costs one turn
+instead of a whole re-education.
+
+The roster is on disk (`~/.agent-bridge/roster/`), so it survives a server restart -
+`continue_*_agent` works on an agent the current process has never seen.
+
+Each entry carries a verdict: `reuse` (warm and recent), `stale` (idle too long, its
+picture of the repo may be wrong), `crowded` (enough context that re-reading it may
+cost more than starting fresh), `suspect` (last run failed), `retired`. Filter with
+`reusable_only=true`, and narrow by `cwd` - matching directory is the strongest signal
+that a warm agent's context is relevant.
+
+`retire_agent` drops one from the recommendations when it goes stale or bad, so its
+warmth stops reading as an endorsement. The session itself is untouched and still
+resumable by hand.
 
 ## Trimming the subagent briefing
 
