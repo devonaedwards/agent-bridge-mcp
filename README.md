@@ -11,7 +11,7 @@ Now includes Opencode + Kimi Code support:
 - `run_opencode_agent` / `launch_opencode_agent` / `continue_opencode_agent`
 - `run_kimi_agent` / `launch_kimi_agent` / `continue_kimi_agent`
 - Any client can call any other with specific model selection, e.g.:
-  - Opencode: `model: "anthropic/claude-sonnet-4"`, `model: "opencode/north-mini-code-free"`, `model: "meta/muse-spark-1.1"`
+  - Opencode: `model: "deepseek/deepseek-v4-flash"` (direct paid DeepSeek API), `model: "anthropic/claude-sonnet-4"`, `model: "opencode/north-mini-code-free"`, `model: "meta/muse-spark-1.1"`
   - Kimi: `model: "kimi-code/k3"`, `model: "kimi-code/kimi-for-coding"`
   - Claude: `model: "haiku"` / `sonnet` / `opus`
   - Codex: `model: "gpt-5.4-mini"` etc.
@@ -30,7 +30,7 @@ Now includes Opencode + Kimi Code support:
 - `launch_opencode_agent` - start `opencode run` in background.
 - `run_kimi_agent` - run `kimi -p` and wait (model alias like `kimi-code/k3`, `kimi-code/kimi-for-coding`).
 - `launch_kimi_agent` - start `kimi -p` in background.
-- `agent_status` - list jobs or inspect one job.
+- `agent_status` - list jobs (compact with alarm fields) or inspect one job in full detail.
 - `agent_result` - collect background job stdout/stderr.
 - `cancel_agent` - terminate a background job.
 - `continue_codex_agent` - interject a follow-up turn into a finished codex job.
@@ -50,12 +50,37 @@ Now includes Opencode + Kimi Code support:
 
 `agent_result` blocks until the job exits, so it is useless mid-flight. `peek_agent`
 reads the agent's own transcript instead - `~/.claude/projects/<slug>/<session_id>.jsonl`
-or `~/.codex/sessions/**/rollout-*.jsonl` - which both CLIs write incrementally. It
-returns normalized events (messages, tool calls, results, status) plus a `cursor`;
-pass that back as `since` to get only what is new.
+or `~/.codex/sessions/**/rollout-*.jsonl` - which both CLIs write incrementally. For
+opencode/kimi/grok, stdout is now streamed incrementally into the bridge's buffer, so
+live peek works without a transcript file. It returns normalized events (messages, tool
+calls, results, status) plus a `cursor`; pass that back as `since` to get only what is
+new.
 
 Codex hides its session id until the job ends, so a running codex job's rollout is
 located by matching `session_meta.cwd` against the job's cwd, newest first.
+
+## `agent_status` alarms
+
+Bare `agent_status()` (no job_id) now returns compact per-job summaries with alarm
+fields — never inlining stdout/stderr. The new fields:
+
+- **`warnings[]`** — stderr lines matching permission/rejection patterns (`permission
+  requested`, `auto-reject`, `denied`, `sandbox`), deduped with counts. Present while
+  the job is still RUNNING — stderr is now streamed incrementally.
+- **`files_changed`** — count from `git status --porcelain` in `job.cwd`. A mutation job
+  with zero changed files is the signal. Omitted when cwd isn't a git repo. Cached 5s.
+- **`suspicious`** — `returncode=0` but implausibly fast or low-token for the prompt.
+  Always carries a `reason` string. Tuned for low false positives.
+- **`auto_rejection_notifications`** — the streaming stderr watcher raises a parent-side
+  `pending_question` when it sees a sandbox auto-rejection, so the parent does not have
+  to notice slow anomalies.
+
+The full payload with resume commands and session notes is still available via
+`agent_status(job_id=...)`; raw stdout/stderr exclusively via `agent_result`.
+
+Every `launch_*` also scans the prompt for path-like tokens outside cwd and logs a
+`sandbox_path_note` naming the paths — the fix is `add_dirs`, caught before launch costs
+anything.
 
 ## Subagent questions (`ask_parent`)
 
@@ -130,6 +155,14 @@ opencode mcp list
 Then you can ask Opencode:
 
 > Use the agent-bridge MCP to launch a Claude subagent with model haiku to summarize this repo.
+
+DeepSeek Flash can request an Opus review through the same MCP, and Opus can hand
+work back to paid Flash. Use the direct provider/model string so this does not
+accidentally select OpenCode's free proxy model:
+
+> Use `launch_claude_agent` with model `opus` to review this plan. Then use
+> `launch_opencode_agent` with model `deepseek/deepseek-v4-flash` for the
+> follow-up implementation.
 
 > Use launch_opencode_agent with model opencode/north-mini-code-free for cheap bulk work.
 
@@ -219,6 +252,9 @@ against codex-cli 0.144.6; four things there are load-bearing:
 - `AGENT_BRIDGE_MAX_DEPTH=2` prevents unbounded loops (e.g. Claude->Codex->Claude).
   Set a larger value in the MCP server environment only when deeper delegation is
   intentional.
+- Streaming buffers cap at 200K chars per stream (head+tail preserved, middle truncated).
+  `STREAM_BUFFER_MAX_CHARS` and `STREAM_BUFFER_HEAD_CHARS` are tunable in the source.
+- Out-of-sandbox path scan runs at every `launch_*` on the prompt text itself.
 - Override binary paths with `CODEX_BIN`, `CLAUDE_BIN`, `OPENCODE_BIN`, `KIMI_BIN`, `GROK_BIN` if needed.
 - Delegation direction is enforced for subagents (top-level launches are the human's
   call and stay unrestricted). See "Delegation" below.

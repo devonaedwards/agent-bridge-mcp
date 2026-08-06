@@ -224,6 +224,40 @@ sandbox blocks writes to `.git`, so a codex agent cannot commit its own work; us
 `commit_paths` and the bridge commits those exact paths on the host after the job
 succeeds. It never runs `git add -A`.
 
+## Watching for trouble at a glance
+
+Bare `agent_status()` (no job_id) now returns a **compact** listing — one line per job
+with the alarm fields, never inlining stdout/stderr. The new fields the parent should
+watch:
+
+- **`warnings[]`** — stderr lines matching sandbox/permission-rejection patterns
+  (`permission requested`, `auto-reject`, `denied`, `external_directory`, etc.), deduped
+  with counts. Present on a running job as soon as the child writes a matching line.
+
+- **`files_changed`** — count of paths from `git status --porcelain` in the job's cwd.
+  A mutation job at 35 minutes with zero changed files is the real signal. Omitted when
+  cwd is not a git repo. Cached for 5 seconds so rapid polling doesn't spawn git per call.
+
+- **`suspicious`** — if `returncode` is 0 but the job finished in under 15 seconds with
+  under 1000 total tokens, or has stderr warnings but claimed success. A bare boolean
+  would make the parent guess, so a `reason` string is always attached. False positives
+  are possible but tuned conservatively — a noisy flag would be ignored within a day.
+
+- **`auto_rejection_notifications`** — when the streaming stderr watcher sees a sandbox
+  auto-rejection, the bridge raises it as a pending question attributed to that job. The
+  subagent already got the rejection and moved on, so these do NOT claim the job is
+  BLOCKED. They appear alongside genuine `pending_questions` where the subagent IS waiting.
+
+The full per-job payload (with resume commands, concerns, and session notes) is still
+available via `agent_status(job_id=...)`. Raw stdout/stderr is exclusively in
+`agent_result`.
+
+**Out-of-sandbox path scan at launch:** every `launch_*` scans the prompt for paths
+(`~/...`, `/absolute/...`, `../../foo`) that resolve outside cwd and are not covered by
+`add_dirs`. On a hit the bridge logs a `sandbox_path_note` in the launch response naming
+the paths. The existing `add_dirs` parameter is the fix — the note tells you what paths
+to add before they become auto-rejection errors that cost a full launch.
+
 ## Recursion
 
 `AGENT_BRIDGE_MAX_DEPTH` (default 2) caps how deep agents can launch agents. Raise it

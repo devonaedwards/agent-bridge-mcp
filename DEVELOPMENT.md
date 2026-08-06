@@ -7,10 +7,18 @@ and no guaranteed venv, so it must run under whatever `python3` it lands on.
 ## Testing
 
 ```bash
-python3 tests/test_protocol.py        # fast, no agents spawned, no tokens spent
-python3 tests/test_live.py claude     # ~1 min, spends tokens
-python3 tests/test_live.py codex      # ~3 min, spends tokens
+python3 tests/test_protocol.py             # fast, no agents spawned, no tokens spent
+python3 tests/test_live.py claude          # ~1 min, spends tokens
+python3 tests/test_live.py codex           # ~3 min, spends tokens
+python3 tests/test_opencode_sandbox_live.py  # ~30s, free model, spends ~nothing
 ```
+
+`test_opencode_sandbox_live.py` is the regression test for a failure worth knowing about:
+opencode has no `--add-dir` flag, so an opencode child auto-rejects every path outside
+its cwd — including this bridge's own STATE_DIR. When that happens `check_notes`,
+`ask_parent` and `raise_concern` all stop working silently, the rejection appears only
+in stderr, and the job still exits 0. A mid-flight correction to this very file was lost
+to it. The grant now rides on `OPENCODE_CONFIG_CONTENT`; that test proves it still does.
 
 Run `test_protocol.py` before every commit. Run the live tests after touching anything
 in the launch path, the preamble, or the codex `-c` overrides.

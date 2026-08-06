@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,27 @@ SERVER_VERSION = "0.5.0-grok-kimi-opencode"
 DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_MAX_OUTPUT_CHARS = 30000
 DEFAULT_MAX_DEPTH = 2
+
+# Streaming buffer caps: a chatty agent must not grow stdout/stderr without bound.
+# When a buffer exceeds this ceiling, the MIDDLE is dropped (head + tail preserved)
+# so the tail — where error messages live — is never silently discarded.
+STREAM_BUFFER_MAX_CHARS = 200_000
+STREAM_BUFFER_HEAD_CHARS = 40_000   # kept from the start
+# tail = STREAM_BUFFER_MAX_CHARS - STREAM_BUFFER_HEAD_CHARS  (kept from the end)
+
+# files_changed TTL: how long git-status porcelain results are cached on the Job object
+# to avoid spawning a git process on every rapid agent_status poll.
+FILES_CHANGED_TTL_SECONDS = 5.0
+
+# Stderr patterns that signal a sandbox or permission rejection. These are what the
+# streaming stderr watcher and the warnings[] scanner look for. Each tuple is a group
+# of patterns; a match on any in the group triggers the same warning dedup key.
+STDERR_WARNING_PATTERNS: list[tuple[str, ...]] = [
+    ("permission requested", "auto-reject", "auto-rejecting"),
+    ("permission denied", "denied", "not permitted", "permission error"),
+    ("external_directory", "external directory", "outside the workspace"),
+    ("sandbox", "sandbox violation", "sandbox policy"),
+]
 
 # Codex only auto-loads AGENTS.md as its project doc, not CLAUDE.md. Every codex
 # prompt gets this preamble so the subagent reads the repo's CLAUDE.md guidance
@@ -430,6 +452,11 @@ class Job:
     process: subprocess.Popen[str] | None = None
     stdout: str = ""
     stderr: str = ""
+    # Cumulative chars discarded by the middle-truncation cap. Tracked here rather than
+    # recomputed, because after the first truncation the buffer no longer knows how much
+    # of the stream it has thrown away.
+    stdout_dropped_chars: int = 0
+    stderr_dropped_chars: int = 0
     returncode: int | None = None
     finished_at: float | None = None
     error: str | None = None
@@ -451,6 +478,9 @@ class Job:
     retired_reason: str | None = None
     rehydrated: bool = False               # came back from the roster, not this process
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Baseline git numstat captured at launch — so files_changed can report
+    # insertions_since_launch rather than absolute numbers from an already-dirty repo.
+    _launch_numstat: str | None = None     # raw output of `git diff --numstat` at launch
 
     @property
     def status(self) -> str:
@@ -504,6 +534,97 @@ def truncate_text(value: str, max_chars: int) -> str:
     return value[:max_chars] + f"\n\n[truncated {omitted} chars]"
 
 
+def _cap_stream_buffer(text: str, already_dropped: int = 0) -> tuple[str, int]:
+    """Truncate the MIDDLE of a stream buffer, preserving head + tail.
+
+    The tail is where errors, warnings, and exit messages land — silently dropping it
+    would defeat the purpose of streaming visibility. Head context is kept so the
+    beginning of the output (model, session id, early messages) is still readable.
+
+    Returns (capped_text, total_dropped). `already_dropped` carries the running total in,
+    because the count CANNOT be recovered from the text itself: this is called once per
+    line, so by the second call `text` is already truncated and `len(text) - MAX` measures
+    only the newest line rather than everything lost so far. Reporting that per-call figure
+    understates reality by orders of magnitude - a real 1.1MB job showed "221 chars
+    truncated" against 905,000 actually dropped, which reads as "you have essentially all
+    the output" when 82% of it is gone. A caller who trusts that number stops looking.
+    """
+    if len(text) <= STREAM_BUFFER_MAX_CHARS:
+        return text, already_dropped
+    tail_chars = STREAM_BUFFER_MAX_CHARS - STREAM_BUFFER_HEAD_CHARS
+    total_dropped = already_dropped + (len(text) - STREAM_BUFFER_MAX_CHARS)
+    marker = f"\n\n[... {total_dropped} chars truncated from middle ...]\n\n"
+    # Account for the marker itself so the result fits within the cap
+    usable_tail = tail_chars - len(marker)
+    if usable_tail < 0:
+        usable_tail = 0
+    return text[:STREAM_BUFFER_HEAD_CHARS] + marker + text[-usable_tail:], total_dropped
+
+
+def _scan_stderr_warnings(stderr: str) -> list[dict[str, Any]]:
+    """Scan accumulated stderr for permission/rejection patterns.
+
+    Returns a compact deduped list of warnings: the matched line (trimmed/truncated to
+    200 chars), a count if repeated, and the pattern group that fired. Designed to help
+    a parent notice sandbox auto-rejections without reading raw stderr.
+    """
+    if not stderr:
+        return []
+    lines = stderr.splitlines()
+    seen: dict[str, dict[str, Any]] = {}  # keyed by (pattern_index, normalized_line)
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for pattern_idx, pattern_group in enumerate(STDERR_WARNING_PATTERNS):
+            matched = False
+            for pat in pattern_group:
+                if pat in stripped.lower():
+                    matched = True
+                    break
+            if not matched:
+                continue
+            # Normalize: collapse whitespace, trim to 200 chars
+            normalized = " ".join(stripped.split())[:200]
+            key = (pattern_idx, normalized)
+            if key in seen:
+                seen[key]["count"] = seen[key].get("count", 1) + 1
+            else:
+                seen[key] = {
+                    "line": normalized,
+                    "count": 1,
+                    "pattern_group_index": pattern_idx,
+                }
+    # Sort by pattern group (so related warnings cluster), then by first occurrence
+    return sorted(seen.values(), key=lambda w: (w["pattern_group_index"], -w["count"]))
+
+
+def _scan_stderr_auto_rejections(stderr: str) -> list[str]:
+    """Extract distinct paths that were auto-rejected from stderr lines.
+
+    Looks for lines matching patterns like 'auto-rejecting external_directory: /foo/bar'
+    and returns the distinct rejected paths. Used by the streaming watcher to raise
+    parent-side questions.
+    """
+    if not stderr:
+        return []
+    rejected: set[str] = set()
+    for line in stderr.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if not ("external_directory" in lower or "outside the workspace" in lower
+                or ("permission" in lower and ("reject" in lower or "denied" in lower))):
+            continue
+        # Match paths: /absolute/paths, ~/relative, ../foo/bar
+        for match in re.finditer(
+            r'(?:/[\w./-]+|~[\w./-]*|\.\.[\w./-]*)', stripped
+        ):
+            path = match.group(0)
+            if len(path) > 2:  # skip bare "/" or "./"
+                rejected.add(path)
+    return sorted(rejected)
+
+
 def require_str(args: dict[str, Any], key: str) -> str:
     value = args.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -552,6 +673,57 @@ def enum_value(args: dict[str, Any], key: str, default: str, allowed: set[str]) 
     return value
 
 
+def _prepare_subagent_sandbox(
+    args: dict[str, Any], cwd: str, prompt: str | None
+) -> tuple[list[str], dict[str, Any]]:
+    """Gather add_dirs, scan the prompt for out-of-sandbox paths, and auto-add STATE_DIR.
+
+    Returns (final_add_dirs, sandbox_note_dict). The note dict has:
+      - `auto_added_dirs`: dirs added by the prompt scan (empty if none)
+      - `state_dir_added`: whether STATE_DIR was auto-added
+      - `total_dirs`: final add_dirs count
+      - `warning`: non-empty if limitations exist
+
+    Called from each launch_* BEFORE build_*, so the widened add_dirs reach the command.
+    """
+    add_dirs = list(optional_string_list(args, "add_dirs"))
+    cwd_resolved = str(Path(cwd).resolve())
+    state_dir_resolved = str(STATE_DIR.resolve())
+
+    # ---- STATE_DIR is not optional plumbing ----
+    # The report channel (check_notes / ask_parent / raise_concern) lives on disk under
+    # STATE_DIR. A subagent whose sandbox blocks that directory cannot ask, cannot read
+    # notes, and cannot raise concerns, and none of that failure is visible to anyone.
+    # So STATE_DIR is always added to the accessible set, without the caller asking.
+    state_dir_already = any(
+        str(Path(d).expanduser().resolve()) == state_dir_resolved
+        for d in add_dirs
+    )
+    if not state_dir_already and cwd_resolved != state_dir_resolved:
+        add_dirs.append(str(STATE_DIR))
+
+    # ---- Out-of-sandbox path scan (item 5) ----
+    to_add: list[str] = []
+    if prompt:
+        to_add, _skipped = _scan_prompt_for_outside_paths(prompt, cwd, add_dirs)
+    for d in to_add:
+        if d not in add_dirs:
+            add_dirs.append(d)
+
+    note: dict[str, Any] = {
+        "auto_added_dirs": to_add,
+        "state_dir_added": not state_dir_already and cwd_resolved != state_dir_resolved,
+        "total_dirs": len(add_dirs),
+    }
+    if to_add:
+        note["warning"] = (
+            f"Prompt references {len(to_add)} path(s) outside cwd. "
+            f"These were added to the subagent's accessible directories "
+            f"to prevent sandbox auto-rejection errors: {', '.join(to_add)}."
+        )
+    return add_dirs, note
+
+
 def resolve_cwd(args: dict[str, Any]) -> str:
     raw_cwd = optional_str(args, "cwd", os.getcwd())
     assert raw_cwd is not None
@@ -561,7 +733,146 @@ def resolve_cwd(args: dict[str, Any]) -> str:
     return cwd
 
 
-def child_env(kind: str, job_id: str | None = None, model: str | None = None) -> dict[str, str]:
+# ---------------------------------------------------------------------------
+# Out-of-sandbox path scanner
+#
+# Scans a prompt text for path-like tokens that resolve outside cwd and are not
+# covered by add_dirs. Catches the "permission requested: external_directory"
+# error before it costs a launch. Auto-adds the directory to add_dirs when
+# detected, with a loud note in the response — a silent add that widens the
+# sandbox beyond what the caller intended is its own hazard.
+# ---------------------------------------------------------------------------
+
+_OUT_OF_SANDBOX_PATH_RE = re.compile(
+    r'(?:^|\s|["\'(])((?:~|\.\.(?:/\.\.)*)/[\w.\-/]*|/[\w.\-/]+)(?:[/:\s"\'.;!?)]|$)'
+)
+
+_BAD_PATH_RE = re.compile(
+    r'(?:'
+        r'https?://|'       # URLs
+        r'\d+\.\d+|'        # version numbers like 2.0.1
+        r'\.{1,2}$|'        # bare . or ..
+        r'^/dev/|'          # /dev/null, /dev/stdin, etc.
+        r'^/proc/|'         # /proc/...
+        r'^/sys/|'          # /sys/...
+        r'^/tmp/'           # /tmp/... is fair to auto-add
+    r')'
+)
+
+
+def _scan_prompt_for_outside_paths(
+    prompt: str, cwd: str, add_dirs: list[str]
+) -> tuple[list[str], list[str]]:
+    """Return (paths_to_add, false_positives_skipped).
+
+    Scans the prompt for path-like tokens that resolve outside cwd. Returns a list of
+    directories that should be added to add_dirs. The false_positives_skipped list is
+    informational only — it shows what we deliberately ignored.
+    """
+    if not prompt:
+        return [], []
+    resolved_cwd = Path(cwd).resolve()
+    resolved_add_dirs = {str(Path(d).expanduser().resolve()) for d in add_dirs}
+    resolved_add_dirs.add(str(resolved_cwd))
+
+    to_add: list[str] = []
+    skipped: list[str] = []
+
+    for match in _OUT_OF_SANDBOX_PATH_RE.finditer(prompt):
+        raw_path = match.group(1)
+        if not raw_path or len(raw_path) < 2:
+            continue
+        if _BAD_PATH_RE.search(raw_path):
+            continue
+        # Skip paths that look like they're inside cwd (e.g., "see src/foo.py")
+        if not raw_path.startswith("/") and not raw_path.startswith("~") and not raw_path.startswith("."):
+            continue
+        try:
+            resolved = Path(raw_path).expanduser().resolve()
+        except (OSError, RuntimeError):
+            skipped.append(raw_path)
+            continue
+        if not resolved.exists():
+            continue  # only flag paths that actually exist
+        resolved_str = str(resolved)
+        # Check if this path (or its parent chain) is already covered
+        parent = resolved
+        already_covered = False
+        while parent != parent.parent:
+            if str(parent) in resolved_add_dirs:
+                already_covered = True
+                break
+            parent = parent.parent
+        if already_covered:
+            continue
+        # Find the closest existing parent directory to add
+        # (we add the containing directory, not the file itself)
+        dir_to_add = resolved.parent if resolved.is_file() else resolved
+        dir_str = str(dir_to_add)
+        if dir_str not in resolved_add_dirs and dir_str not in to_add:
+            to_add.append(dir_str)
+    return to_add, skipped
+
+
+def opencode_permission_env(add_dirs: list[str]) -> str | None:
+    """Build OPENCODE_CONFIG_CONTENT granting opencode access to `add_dirs`.
+
+    Opencode is the one client with no `--add-dir` flag: `opencode run --dir` sets the
+    working directory and nothing else, so every path outside it is refused by opencode's
+    own permission layer with
+
+        permission requested: external_directory (<path>/*); auto-rejecting
+
+    which lands in stderr, is not an error, and does not stop the run. A subagent hitting
+    that on STATE_DIR loses check_notes, ask_parent and raise_concern in one go - the
+    report channel goes silently dead while the job looks perfectly healthy. That is not
+    hypothetical: it is how a mid-flight correction to this very file was lost.
+
+    Opencode's config does expose the knob the CLI does not - `permission.external_directory`
+    maps a glob to allow/ask/deny - and OPENCODE_CONFIG_CONTENT is MERGED over the resolved
+    config rather than replacing it (verified: `opencode debug config` with the variable set
+    still shows the user's providers, model and mcp servers, with permission added). So the
+    grant can be injected per-child, scoped to exactly the directories this job was given,
+    without touching the user's own config file.
+
+    Deliberately narrow: only the listed directories are allowed, never a blanket rule.
+    `--auto` would also silence the rejection, but by auto-approving EVERYTHING the agent
+    asks for, which trades a visible failure for an invisible one.
+    """
+    if not add_dirs:
+        return None
+    # Preserve anything the parent already set rather than clobbering it - the value is a
+    # general config channel and may legitimately carry unrelated keys.
+    existing: dict[str, Any] = {}
+    raw = os.environ.get("OPENCODE_CONFIG_CONTENT")
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (ValueError, TypeError):
+            # Malformed inherited value: ignore it rather than propagate a broken config.
+            existing = {}
+
+    permission = dict(existing.get("permission") or {})
+    external = permission.get("external_directory")
+    # The schema allows a bare "allow"/"ask"/"deny" string here as well as a glob map.
+    # A pre-existing string is a broader policy than anything we would add, so leave it.
+    if isinstance(external, str):
+        return json.dumps(existing) if raw else None
+    external = dict(external or {})
+    for directory in add_dirs:
+        resolved = str(Path(directory).expanduser().resolve())
+        # `/**` rather than `/*`: the rejection is raised for nested paths too
+        # (questions/, notes/, concerns/, roster/ all live under STATE_DIR).
+        external[f"{resolved}/**"] = "allow"
+    permission["external_directory"] = external
+    existing["permission"] = permission
+    return json.dumps(existing)
+
+
+def child_env(kind: str, job_id: str | None = None, model: str | None = None,
+              add_dirs: list[str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     depth = current_depth()
     env["AGENT_BRIDGE_DEPTH"] = str(depth + 1)
@@ -586,6 +897,14 @@ def child_env(kind: str, job_id: str | None = None, model: str | None = None) ->
         env["AGENT_BRIDGE_MODEL"] = model
     else:
         env.pop("AGENT_BRIDGE_MODEL", None)
+
+    # Every other client takes its accessible directories as a CLI flag, wired up in the
+    # matching build_* function. Opencode has no such flag, so its grant is an env var -
+    # see opencode_permission_env for why this is the only route.
+    if kind == "opencode":
+        config_content = opencode_permission_env(add_dirs or [])
+        if config_content:
+            env["OPENCODE_CONFIG_CONTENT"] = config_content
     return env
 
 
@@ -1090,8 +1409,10 @@ CODEX_MODEL_TIERS_FALLBACK = [
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 ]
 # Opencode can run many providers; we order by known capability - meta's spark at top,
-# then heavier opencode models, then free lightweight ones. Unknown models still work
-# because enforce_delegation allows unknown own_rank but checks requested.
+# then heavier opencode models, then free lightweight ones. The direct, paid DeepSeek
+# Flash endpoint is listed separately from OpenCode's free proxy model so callers can
+# select it unambiguously. Unknown models still work because enforce_delegation allows
+# unknown own_rank but checks requested.
 OPENCODE_MODEL_TIERS = [
     "meta/muse-spark-1.1",
     "opencode/big-pickle",
@@ -1099,6 +1420,7 @@ OPENCODE_MODEL_TIERS = [
     "anthropic/claude-sonnet-4",
     "openai/gpt-5",
     "openai/gpt-4.1",
+    "deepseek/deepseek-v4-flash",
     "opencode/deepseek-v4-flash-free",
     "opencode/laguna-s-2.1-free",
     "opencode/ling-3.0-flash-free",
@@ -1195,6 +1517,7 @@ CAPABILITY_CLASS_MEMBERS: dict[str, list[str]] = {
         "kimi-code/kimi-for-coding-highspeed",
         "grok-3-mini",
         "grok-4.5-build-free",
+        "deepseek/deepseek-v4-flash",
         "opencode/deepseek-v4-flash-free",
         "opencode/laguna-s-2.1-free",
         "opencode/ling-3.0-flash-free",
@@ -1215,14 +1538,24 @@ CAPABILITY_CLASS_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
     ("workhorse", ("sonnet", "-terra", "-luna", "gpt-5", "kimi", "grok-")),
 ]
 
-# Models the human has declared equivalent, so delegation between them is allowed
-# in BOTH directions no matter how the class table ranks them. "Sol" is codex's
-# frontier (gpt-5.6-sol); Opus is claude's. Devon wants that pairing explicit
-# rather than an emergent property of the table, so a lineup change or a stale
-# ladder entry can't quietly turn a peer handoff back into a blocked escalation.
+# Models the human has declared eligible for bidirectional delegation, so handoffs
+# between them are allowed in BOTH directions no matter how the class table ranks
+# them. This is a routing permission, not a claim that the models have identical
+# capabilities. Keeping it explicit means a lineup change cannot quietly block a
+# deliberate cross-vendor review loop.
 PEER_MODELS: list[set[str]] = [
     {
         "gpt-5.6-sol",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+    },
+    {
+        # Direct paid DeepSeek API through OpenCode <-> Claude Code Opus.
+        # The free OpenCode-hosted DeepSeek Flash model is deliberately excluded.
+        "deepseek/deepseek-v4-flash",
+        "opus",  # Claude Code's supported short model selector.
         "claude-opus-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
@@ -1437,7 +1770,8 @@ def command_preview(command: list[str]) -> list[str]:
 
 
 def build_codex_command(
-    args: dict[str, Any], background: bool = False, job_id: str | None = None
+    args: dict[str, Any], background: bool = False, job_id: str | None = None,
+    add_dirs_override: list[str] | None = None,
 ) -> tuple[list[str], str, str, int, dict[str, Any]]:
     prompt = with_claude_md_preamble(require_str(args, "prompt"))
     # Advertise ask_parent only if codex can actually reach the bridge: either we're
@@ -1465,7 +1799,7 @@ def build_codex_command(
     # and `codex resume <id>`). Pass ephemeral=true explicitly to opt out (non-resumable).
     ephemeral = optional_bool(args, "ephemeral", False)
     skip_git_repo_check = optional_bool(args, "skip_git_repo_check", True)
-    add_dirs = optional_string_list(args, "add_dirs")
+    add_dirs = add_dirs_override if add_dirs_override is not None else optional_string_list(args, "add_dirs")
     extra_args = optional_string_list(args, "extra_args")
 
     command = [
@@ -1543,7 +1877,7 @@ def always_allowed_report_tools(
     return allowed, disallowed
 
 
-def build_claude_command(args: dict[str, Any], background: bool = False) -> tuple[list[str], str, str, int, dict[str, Any]]:
+def build_claude_command(args: dict[str, Any], background: bool = False, add_dirs_override: list[str] | None = None) -> tuple[list[str], str, str, int, dict[str, Any]]:
     prompt = require_str(args, "prompt")
     if background:
         prompt = with_ask_parent_preamble(
@@ -1567,7 +1901,7 @@ def build_claude_command(args: dict[str, Any], background: bool = False) -> tupl
     # Pre-assign a session id so the resume command is known immediately, without having
     # to parse it out of json output (works even with the default text output format).
     session_id = optional_str(args, "session_id") or str(uuid.uuid4())
-    add_dirs = optional_string_list(args, "add_dirs")
+    add_dirs = add_dirs_override if add_dirs_override is not None else optional_string_list(args, "add_dirs")
     allowed_tools = optional_string_list(args, "allowed_tools")
     disallowed_tools = optional_string_list(args, "disallowed_tools")
     if background:
@@ -1611,17 +1945,23 @@ def build_claude_command(args: dict[str, Any], background: bool = False) -> tupl
 
 
 def build_opencode_command(
-    args: dict[str, Any], background: bool = False
+    args: dict[str, Any], background: bool = False,
+    add_dirs_override: list[str] | None = None,
 ) -> tuple[list[str], str, str, int, dict[str, Any]]:
     """Build an `opencode run` command.
 
     Opencode's CLI: `opencode run --format json --dir <cwd> -m <model> <prompt>`
     Background launches advertise the parent question channel (ask_parent / check_notes)
     using opencode's direct tool names (no mcp__ prefix).
+
+    Opencode has NO per-directory sandbox flag (--dir sets the working directory only,
+    not additional accessible directories). The `add_dirs_override` parameter is accepted
+    for interface uniformity with other build_* functions but does not expand the
+    subagent's filesystem access. The caller is told this limitation in the launch
+    response.
     """
     prompt = require_str(args, "prompt")
     if background and (opencode_has_bridge() or os.environ.get("AGENT_BRIDGE_PARENT") == "opencode"):
-        # opencode always has bridge if we registered it globally, but check file anyway
         prompt = with_ask_parent_preamble(
             prompt,
             OPENCODE_ASK_PARENT_TOOL,
@@ -1639,13 +1979,16 @@ def build_opencode_command(
     variant = optional_str(args, "variant")
     agent_name = optional_str(args, "agent")
     output_format = enum_value(args, "output_format", "json", {"json", "default"})
-    # Always use json for easier parsing of reply + tokens + session_id; caller can request default
-    # but we normalize to json internally.
     if output_format not in ("json", "default"):
         output_format = "json"
 
     extra_args = optional_string_list(args, "extra_args")
-    no_session_persistence = False  # opencode persists by default, no flag to disable in same way
+    no_session_persistence = False
+
+    # Opencode has no --add-dir flag; we include add_dirs_override for interface
+    # consistency only. The caller is told in the launch response that add_dirs
+    # could not be honored for this client.
+    _ = add_dirs_override  # accepted, cannot be applied to the command
 
     command = [
         opencode_bin,
@@ -1678,14 +2021,14 @@ def build_opencode_command(
 
 
 def build_kimi_command(
-    args: dict[str, Any], background: bool = False
+    args: dict[str, Any], background: bool = False,
+    add_dirs_override: list[str] | None = None,
 ) -> tuple[list[str], str, str, int, dict[str, Any]]:
     """Build a `kimi -p` command.
 
-    Kimi Code CLI: `kimi -p <prompt> --output-format stream-json -m <model>`
+    Kimi Code CLI: `kimi -p <prompt> --output-format stream-json -m <model> --add-dir <dir>`
     Cwd is handled via subprocess cwd, since kimi has no --dir flag.
-    Background launches advertise the parent question channel (ask_parent)
-    using kimi's mcp__agent-bridge__* naming.
+    `--add-dir` (repeatable) widens accessible directories. STATE_DIR is always added.
     """
     prompt = require_str(args, "prompt")
     if background and (kimi_has_bridge() or os.environ.get("AGENT_BRIDGE_PARENT") == "kimi"):
@@ -1700,7 +2043,6 @@ def build_kimi_command(
         )
     cwd = resolve_cwd(args)
     timeout_seconds = optional_int(args, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 1, 24 * 60 * 60)
-    # Prefer KIMI_BIN env, then fallback to ~/.kimi-code/bin/kimi, then plain "kimi"
     kimi_bin = os.environ.get("KIMI_BIN") or os.environ.get("KIMI_CODE_BIN")
     if not kimi_bin:
         default_path = Path("~/.kimi-code/bin/kimi").expanduser()
@@ -1709,16 +2051,17 @@ def build_kimi_command(
     model = optional_str(args, "model")
     output_format = enum_value(args, "output_format", "stream-json", {"stream-json", "text"})
     extra_args = optional_string_list(args, "extra_args")
-    yolo = optional_bool(args, "yolo", True)  # default to yolo/auto for non-interactive
+    yolo = optional_bool(args, "yolo", True)
+    add_dirs = add_dirs_override if add_dirs_override is not None else optional_string_list(args, "add_dirs")
 
     command = [kimi_bin]
     if model:
         command.extend(["-m", model])
-    # prompt mode
     command.extend(["-p", prompt, "--output-format", output_format])
     if yolo:
-        # kimi -p already auto, but --yolo flag not allowed with -p per docs; we use default auto behavior
         pass
+    for add_dir in add_dirs:
+        command.extend(["--add-dir", str(Path(add_dir).expanduser().resolve())])
     command.extend(extra_args)
 
     meta = {
@@ -1800,13 +2143,18 @@ def _parse_kimi_stream_json(stdout: str) -> dict[str, Any]:
 
 
 def build_grok_command(
-    args: dict[str, Any], background: bool = False
+    args: dict[str, Any], background: bool = False,
+    add_dirs_override: list[str] | None = None,
 ) -> tuple[list[str], str, str, int, dict[str, Any]]:
     """Build a `grok -p` command.
 
     Grok CLI: `grok -p <prompt> --output-format json|plain -m <model> --cwd <cwd>`
-    Background launches advertise the parent question channel using direct tool names
-    (grok exposes tools as direct names like ask_parent, per logs).
+
+    Grok has no per-directory sandbox flag (--sandbox accepts a profile name, not paths,
+    and --allow controls tool permissions, not filesystem access). The
+    `add_dirs_override` parameter is accepted for interface uniformity but does not
+    expand the subagent's filesystem access. The caller is told this limitation in the
+    launch response.
     """
     prompt = require_str(args, "prompt")
     if background and (grok_has_bridge() or os.environ.get("AGENT_BRIDGE_PARENT") == "grok"):
@@ -1828,6 +2176,7 @@ def build_grok_command(
     model = optional_str(args, "model")
     output_format = enum_value(args, "output_format", "json", {"json", "plain", "streaming-json"})
     extra_args = optional_string_list(args, "extra_args")
+    _ = add_dirs_override  # accepted, cannot be applied (grok --sandbox is profile-based)
 
     command = [grok_bin, "-p", prompt, "--output-format", output_format]
     if model:
@@ -1964,7 +2313,140 @@ def _parse_opencode_json_events(stdout: str) -> dict[str, Any]:
     return {"reply": reply, "usage": usage, "session_id": session_id, "cost": cost}
 
 
-def run_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, max_output_chars: int) -> dict[str, Any]:
+def _git_numstat_parse(raw: str) -> tuple[int, int]:
+    """Sum insertions and deletions from git diff --numstat output."""
+    ins = 0
+    dels = 0
+    for line in raw.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            try:
+                ins += int(parts[0]) if parts[0] != "-" else 0
+                dels += int(parts[1]) if parts[1] != "-" else 0
+            except ValueError:
+                pass
+    return ins, dels
+
+
+def _files_changed(job: Any) -> dict[str, Any] | None:
+    """Count changed files and insertions/deletions from git in job.cwd.
+
+    Returns an object (never a raw int) with:
+      - `files` — changed-path count from git status --porcelain
+      - `insertions` / `deletions` — summed from git diff --numstat
+      - `untracked` — new-file count (not in numstat)
+      - `insertions_since_launch` — delta against the launch baseline (the field that
+        answers "has this job actually done anything" on an already-dirty repo)
+
+    Returns None when cwd is not a git repo (field omitted from the payload).
+    Cached with a short TTL so rapid agent_status polling doesn't spawn git per call.
+    """
+    now = time.time()
+    with job.lock:
+        cached = getattr(job, "_files_changed_cache", None)
+        baseline = getattr(job, "_launch_numstat", None)
+    if cached is not None:
+        count, cached_at = cached
+        if now - cached_at < FILES_CHANGED_TTL_SECONDS:
+            return count
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", job.cwd, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        files = len(lines)
+        untracked = sum(1 for l in lines if l.startswith("??"))
+
+        # numstat for insertions/deletions on tracked files
+        ins = 0
+        dels = 0
+        ins_since_launch: int | None = None
+        numstat_proc = subprocess.run(
+            ["git", "-C", job.cwd, "diff", "--numstat"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if numstat_proc.returncode == 0 and numstat_proc.stdout.strip():
+            ins, dels = _git_numstat_parse(numstat_proc.stdout)
+            if baseline is not None:
+                base_ins, base_dels = _git_numstat_parse(baseline)
+                # The current numstat minus the baseline numstat is the net change
+                # attributable to this job. Floor at 0 — files can be cleaned.
+                ins_since_launch = max(0, ins - base_ins)
+
+        result: dict[str, Any] = {
+            "files": files,
+            "insertions": ins,
+            "deletions": dels,
+            "untracked": untracked,
+        }
+        if ins_since_launch is not None:
+            result["insertions_since_launch"] = ins_since_launch
+        with job.lock:
+            job._files_changed_cache = (result, now)
+        return result
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        return None
+
+
+def _suspicious_check(job: Any) -> dict[str, Any] | None:
+    """Flag implausible successes: returncode 0 but the job didn't produce evidence of work.
+
+    Signals checked, in order of confidence (strongest first):
+      1. insertions_since_launch == 0 on a mutation job — the repo hasn't changed at all
+      2. Finished in <15 seconds with <1000 total tokens
+      3. Stderr has warnings but the job claimed success
+
+    Prefer false negatives over noisy false positives: a suspicious flag that fires on
+    healthy jobs will be ignored within a day.
+    """
+    with job.lock:
+        returncode = job.returncode
+        elapsed = (job.finished_at or time.time()) - job.started_at
+        tokens = job.tokens
+        stderr_buf = job.stderr if job.stderr else ""
+    if returncode != 0:
+        return None
+
+    reasons: list[str] = []
+    # Signal 1: insertions_since_launch (strongest — a zero-change mutation job is clear)
+    fc = _files_changed(job)
+    if fc is not None and fc.get("insertions_since_launch") is not None:
+        if fc["insertions_since_launch"] == 0 and fc.get("files", 0) == 0:
+            reasons.append(
+                f"returned 0 in {elapsed:.1f}s with zero git changes (insertions_since_launch=0)"
+            )
+
+    # Signal 2: elapsed/output token floor (weaker heuristic)
+    output_tokens = (tokens or {}).get("output_tokens", 0) or 0
+    total_tokens = (tokens or {}).get("total_tokens", 0) or 0
+    if elapsed < 15 and total_tokens < 1000:
+        reasons.append(
+            f"finished in {elapsed:.1f}s with only {total_tokens} total tokens "
+            f"(output: {output_tokens})"
+        )
+
+    # Signal 3: stderr warnings with clean exit (weakest)
+    if elapsed < 30 and stderr_buf:
+        warnings = _scan_stderr_warnings(stderr_buf)
+        if warnings:
+            reasons.append(
+                f"returned 0 in {elapsed:.1f}s but stderr has {len(warnings)} "
+                f"warning(s): {warnings[0].get('line', '')[:120]}"
+            )
+
+    if not reasons:
+        return None
+    return {
+        "suspicious": True,
+        "reason": "; ".join(reasons),
+        "elapsed_seconds": round(elapsed, 1),
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
     enforce_depth()
     started_at = time.time()
     feeds_stdin = command[-1] == "-"
@@ -2020,9 +2502,10 @@ def git_commit_paths(cwd: str, paths: list[str], message: str) -> dict[str, Any]
         return {"committed": False, "hash": None, "detail": f"exception: {exc}"}
 
 
-def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, commit_paths: list[str] | None = None, commit_message: str | None = None, meta: dict[str, Any] | None = None, job_id: str | None = None, task: str | None = None) -> dict[str, Any]:
+def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, commit_paths: list[str] | None = None, commit_message: str | None = None, meta: dict[str, Any] | None = None, job_id: str | None = None, task: str | None = None, sandbox_note: dict[str, Any] | None = None, add_dirs: list[str] | None = None) -> dict[str, Any]:
     enforce_depth()
     enforce_delegation(kind, (meta or {}).get("model"))
+
     # The job id reaches the child so ask_parent can address questions back at this job.
     # Callers that must bake it into the command itself (launch_codex, via -c env
     # overrides) generate it first and pass it in; otherwise make one here.
@@ -2030,7 +2513,7 @@ def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, 
     process = subprocess.Popen(
         command,
         cwd=cwd,
-        env=child_env(kind, job_id=job_id, model=(meta or {}).get("model")),
+        env=child_env(kind, job_id=job_id, model=(meta or {}).get("model"), add_dirs=add_dirs),
         # DEVNULL (never None) when we aren't piping a prompt: None would make the child
         # INHERIT the server's stdin (the JSON-RPC pipe), and a subagent that reads stdin
         # (e.g. `claude --print`) then steals incoming requests, hanging agent_status.
@@ -2068,10 +2551,23 @@ def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, 
     with jobs_lock:
         jobs[job.id] = job
 
+    # ---- Correction 3: capture git numstat baseline at launch ----
+    # An already-dirty repo makes absolute changed-file counts meaningless. The delta
+    # against a launch-time baseline is what answers "has this job actually done anything."
+    try:
+        baseline = subprocess.run(
+            ["git", "-C", job.cwd, "diff", "--numstat"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if baseline.returncode == 0:
+            job._launch_numstat = baseline.stdout
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        pass
+
     thread = threading.Thread(target=collect_job, args=(job, prompt), daemon=True)
     thread.start()
 
-    return {
+    response: dict[str, Any] = {
         "job_id": job.id,
         "kind": kind,
         "pid": process.pid,
@@ -2081,29 +2577,164 @@ def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, 
         "session_id": job.session_id,
         "command": command_preview(command),
     }
+    if sandbox_note:
+        response["sandbox"] = sandbox_note
+    return response
+
+
+def _maybe_raise_auto_rejection_question(
+    job: Job, stderr_line: str, seen: set[str]
+) -> None:
+    """When the streaming stderr watcher sees a sandbox auto-rejection, raise it as a
+    parent-side pending_question. This fixes "why didn't the agent ask" structurally:
+    it no longer depends on the model noticing the rejection in its own stderr.
+
+    The question record is a NOTIFICATION, not a blocked-subagent: the subagent already
+    got rejected and moved on, so answer_agent semantics are advisory here. The record
+    carries `action: "notify"` so the parent can distinguish it from a genuine blocked
+    question where the subagent is waiting.
+    """
+    lower = stderr_line.strip().lower()
+    if not (("external_directory" in lower or "outside the workspace" in lower
+             or "auto-reject" in lower or "permission" in lower)):
+        return
+    # Don't re-raise a path we've already raised for this job
+    paths = _scan_stderr_auto_rejections(stderr_line)
+    new_paths = [p for p in paths if p not in seen]
+    if not new_paths:
+        return
+    seen.update(new_paths)
+
+    for path in new_paths:
+        question_id = str(uuid.uuid4())
+        record = {
+            "question_id": question_id,
+            "job_id": job.id,
+            "from_kind": "bridge",
+            "question": (
+                f"Sandbox auto-rejection detected for job {job.id}: "
+                f"access to '{path}' was denied by the sandbox. "
+                f"The subagent already received the rejection and moved on — it is NOT "
+                f"blocked waiting for this answer. You may want to relaunch with add_dirs "
+                f"covering this path, or adjust the sandbox configuration."
+            ),
+            "context": (
+                f"Stderr line: {stderr_line.strip()[:300]}\n"
+                f"Rejected path: {path}\n"
+                f"CWD: {job.cwd}"
+            ),
+            "status": "pending",
+            "asked_at": time.time(),
+            "answer": None,
+            "answered_at": None,
+            "on_timeout": "proceed",
+            "ancestry": [j for j in (os.environ.get("AGENT_BRIDGE_ANCESTRY") or "").split(",") if j],
+            "depth": current_depth() + 1,
+            "escalated": False,
+            "escalation_notes": [],
+            # Marks this as a notification, not a blocked-subagent question. The
+            # existing blocked-subagent semantics (answer_agent unblocks the subagent,
+            # action_required claims the job is BLOCKED) are preserved for genuine
+            # ask_parent questions and do NOT apply here.
+            "auto_rejection_notification": True,
+        }
+        _write_question(record)
+        log(f"auto-rejection question {question_id} for job {job.id}: {path}")
 
 
 def collect_job(job: Job, prompt: str | None) -> None:
+    """Run the child process, streaming stdout/stderr into job under lock.
+
+    Before this rewrite, collect_job called `process.communicate()`, which blocked
+    until the child exited — so job.stdout and job.stderr were empty strings for the
+    entire life of a running job. Nothing that read them mid-flight could work. The
+    parent caught failures only by noticing anomalies like "10 seconds elapsed on a
+    multi-file port" after the fact.
+
+    Now dedicated reader threads append to job.stdout / job.stderr as lines arrive, and
+    a stdin writer thread feeds the prompt when `command[-1] == "-"`. Every existing
+    behavior is preserved: the timeout path (terminate, then SIGKILL on posix with
+    returncode fallback -signal.SIGTERM), the exception path (returncode -1), and the
+    post-job sequence (enrich_job, save_to_roster, optional git_commit_paths).
+    """
+    # Stderr auto-rejection tracker: paths we've already raised parent questions for,
+    # so we don't spam one question per repeated rejection.
+    auto_rejection_paths_seen: set[str] = set()
+
+    def _reader_thread(stream_name: str) -> None:
+        """Read lines from a process stream and append to job.stdout / job.stderr."""
+        stream = getattr(job.process, stream_name)
+        buf_attr = stream_name
+        for line in iter(stream.readline, ""):
+            with job.lock:
+                current = getattr(job, buf_attr)
+                # The running dropped-total lives on the Job because it cannot be derived
+                # from the buffer once truncation has started - see _cap_stream_buffer.
+                dropped_attr = f"{buf_attr}_dropped_chars"
+                capped, dropped = _cap_stream_buffer(
+                    current + line, getattr(job, dropped_attr, 0))
+                setattr(job, buf_attr, capped)
+                setattr(job, dropped_attr, dropped)
+            # On each stderr line, check for auto-rejections that warrant a parent question.
+            # This runs in the reader thread to catch the signal as it arrives, not after
+            # the job finishes — the whole point is early visibility.
+            if stream_name == "stderr" and line.strip():
+                _maybe_raise_auto_rejection_question(job, line, auto_rejection_paths_seen)
+
+    def _stdin_writer() -> None:
+        """Write the prompt to stdin, then close it so the child sees EOF."""
+        if prompt is None:
+            return
+        try:
+            job.process.stdin.write(prompt)
+            job.process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            # Child exited before reading all input — not an error worth surfacing.
+            pass
+        finally:
+            try:
+                job.process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+    # Start reader threads BEFORE the stdin writer, so no output is ever lost. The
+    # process is already running; stdout and stderr may already have data buffered.
+    stdout_thread = threading.Thread(target=_reader_thread, args=("stdout",), daemon=True)
+    stderr_thread = threading.Thread(target=_reader_thread, args=("stderr",), daemon=True)
+    stdin_thread = threading.Thread(target=_stdin_writer, daemon=True)
+
+    stdout_thread.start()
+    stderr_thread.start()
+    if job.command[-1] == "-":
+        stdin_thread.start()
+
+    # Wait for the process to exit, with timeout handling identical to the old path.
     try:
-        stdout, stderr = job.process.communicate(input=prompt, timeout=job.timeout_seconds)
+        job.process.wait(timeout=job.timeout_seconds)
+        # Process exited; wait for reader threads to drain the remaining output.
+        stdout_thread.join(timeout=30)
+        stderr_thread.join(timeout=30)
+        if job.command[-1] == "-":
+            stdin_thread.join(timeout=10)
         with job.lock:
-            job.stdout = stdout or ""
-            job.stderr = stderr or ""
             job.returncode = job.process.returncode
             job.finished_at = time.time()
     except subprocess.TimeoutExpired:
         job.process.terminate()
         try:
-            stdout, stderr = job.process.communicate(timeout=10)
+            job.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             if os.name == "posix":
                 os.kill(job.process.pid, signal.SIGKILL)
             else:
                 job.process.kill()
-            stdout, stderr = job.process.communicate()
+            job.process.wait()
+        # Drain remaining output after termination.
+        stdout_thread.join(timeout=30)
+        stderr_thread.join(timeout=30)
+        if job.command[-1] == "-":
+            stdin_thread.join(timeout=10)
         with job.lock:
-            job.stdout = stdout or ""
-            job.stderr = stderr or ""
             job.error = f"timed out after {job.timeout_seconds} seconds"
             job.returncode = job.process.returncode if job.process.returncode is not None else -signal.SIGTERM
             job.finished_at = time.time()
@@ -2591,6 +3222,8 @@ def summarize_job(job: Job) -> dict[str, Any]:
         session_id = job.session_id
         model = job.model
         tokens = job.tokens
+        stderr_buf = job.stderr
+        stdout_buf = job.stdout
         summary = {
             "job_id": job.id,
             "kind": job.kind,
@@ -2611,6 +3244,29 @@ def summarize_job(job: Job) -> dict[str, Any]:
     summary["session_id"] = session_id
     summary["tokens"] = _job_token_summary(tokens)
 
+    # ---- Item 1: warnings[] from stderr scanning ----
+    # Must work while the job is still RUNNING — that's the whole point. The streaming
+    # threads update job.stderr incrementally, so warnings appear as soon as the child
+    # writes a matching line, long before it exits.
+    stderr_warnings = _scan_stderr_warnings(stderr_buf)
+    if stderr_warnings:
+        summary["warnings"] = stderr_warnings
+        summary["warning_count"] = len(stderr_warnings)
+
+    # ---- Item 2: files_changed for mutation jobs ----
+    # A mutation job at 35 minutes with zero changed files is the real signal that
+    # something went wrong. Cached with a short TTL so rapid polling doesn't spawn git.
+    fc = _files_changed(job)
+    if fc is not None:
+        summary["files_changed"] = fc
+
+    # ---- Item 3: suspicious flag ----
+    # Flag implausible successes: returncode 0 but elapsed/tokens below floor.
+    if job.status == "succeeded":
+        susp = _suspicious_check(job)
+        if susp:
+            summary["suspicious"] = susp
+
     # A blocked subagent is stuck until someone answers, and nothing else in this payload
     # would reveal that - it just looks like a slow job. Surface it loudly.
     raised = concerns_for(job.id)
@@ -2630,19 +3286,35 @@ def summarize_job(job: Job) -> dict[str, Any]:
 
     blocked = pending_questions_for(job.id)
     if blocked:
-        summary["pending_questions"] = [
-            {
-                "question_id": q["question_id"],
-                "question": q["question"],
-                "context": q.get("context") or None,
-                "waiting_seconds": round(time.time() - q["asked_at"], 1) if q.get("asked_at") else None,
-            }
-            for q in blocked
-        ]
-        summary["action_required"] = (
-            f"{len(blocked)} subagent question(s) awaiting an answer - this job is BLOCKED "
-            "until you call answer_agent(question_id=..., answer=...)."
-        )
+        # Separate auto-rejection notifications from genuine blocked questions. The
+        # subagent is NOT waiting for an answer on auto-rejections (it already moved on),
+        # so action_required must not claim the job is BLOCKED.
+        real_questions = [q for q in blocked if not q.get("auto_rejection_notification")]
+        notifications = [q for q in blocked if q.get("auto_rejection_notification")]
+        if real_questions:
+            summary["pending_questions"] = [
+                {
+                    "question_id": q["question_id"],
+                    "question": q["question"],
+                    "context": q.get("context") or None,
+                    "waiting_seconds": round(time.time() - q["asked_at"], 1) if q.get("asked_at") else None,
+                }
+                for q in real_questions
+            ]
+            summary["action_required"] = (
+                f"{len(real_questions)} subagent question(s) awaiting an answer - this job "
+                "is BLOCKED until you call answer_agent(question_id=..., answer=...)."
+            )
+        if notifications:
+            summary["auto_rejection_notifications"] = [
+                {
+                    "question_id": n["question_id"],
+                    "path": n.get("context", "").split("Rejected path: ")[-1].split("\n")[0]
+                        if "Rejected path: " in (n.get("context") or "") else "unknown",
+                    "detail": n["question"][:200],
+                }
+                for n in notifications
+            ]
     if session_id:
         if kind == "codex":
             # Interactive command Devon can paste into his own terminal to open the
@@ -2807,10 +3479,17 @@ def launch_codex(args: dict[str, Any]) -> dict[str, Any]:
     # The id must exist before the command is built: it goes into the -c env override so
     # the subagent's own bridge server knows which job its questions belong to.
     job_id = str(uuid.uuid4())
-    command, prompt, cwd, timeout_seconds, meta = build_codex_command(args, background=True, job_id=job_id)
+    cwd = resolve_cwd(args)
+    # Scan and widen add_dirs BEFORE building the command (Correction 1)
+    task = optional_str(args, "prompt")
+    widened_dirs, sandbox_note = _prepare_subagent_sandbox(args, cwd, task)
+    command, prompt, cwd, timeout_seconds, meta = build_codex_command(
+        args, background=True, job_id=job_id, add_dirs_override=widened_dirs)
     commit_paths = optional_string_list(args, "commit_paths")
     commit_message = optional_str(args, "commit_message")
-    return tool_response(launch_command("codex", command, prompt, cwd, timeout_seconds, commit_paths=commit_paths, commit_message=commit_message, meta=meta, job_id=job_id, task=optional_str(args, "prompt")))
+    return tool_response(launch_command("codex", command, prompt, cwd, timeout_seconds,
+        commit_paths=commit_paths, commit_message=commit_message, meta=meta, job_id=job_id,
+        task=task, sandbox_note=sandbox_note))
 
 
 def run_claude(args: dict[str, Any]) -> dict[str, Any]:
@@ -2823,8 +3502,11 @@ def run_claude(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def launch_claude(args: dict[str, Any]) -> dict[str, Any]:
-    command, prompt, cwd, timeout_seconds, meta = build_claude_command(args, background=True)
-    return tool_response(launch_command("claude", command, None if command[-1] != "-" else prompt, cwd, timeout_seconds, meta=meta, task=optional_str(args, "prompt")))
+    cwd = resolve_cwd(args)
+    task = optional_str(args, "prompt")
+    widened_dirs, sandbox_note = _prepare_subagent_sandbox(args, cwd, task)
+    command, prompt, cwd, timeout_seconds, meta = build_claude_command(args, background=True, add_dirs_override=widened_dirs)
+    return tool_response(launch_command("claude", command, None if command[-1] != "-" else prompt, cwd, timeout_seconds, meta=meta, task=task, sandbox_note=sandbox_note))
 
 
 def run_opencode(args: dict[str, Any]) -> dict[str, Any]:
@@ -2846,9 +3528,22 @@ def run_opencode(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def launch_opencode(args: dict[str, Any]) -> dict[str, Any]:
-    command, prompt, cwd, timeout_seconds, meta = build_opencode_command(args, background=True)
-    # For opencode, prompt is part of command, not stdin
-    return tool_response(launch_command("opencode", command, None, cwd, timeout_seconds, meta=meta, task=optional_str(args, "prompt")))
+    cwd = resolve_cwd(args)
+    task = optional_str(args, "prompt")
+    widened_dirs, sandbox_note = _prepare_subagent_sandbox(args, cwd, task)
+    # Opencode has no --add-dir flag, so the grant cannot ride on the command the way it
+    # does for every other client. It goes through OPENCODE_CONFIG_CONTENT instead, applied
+    # in child_env - see opencode_permission_env. Same directories, different transport.
+    sandbox_note["granted_via"] = "OPENCODE_CONFIG_CONTENT (permission.external_directory)"
+    sandbox_note["opencode_addirs_note"] = (
+        "Opencode has no --add-dir flag (--dir sets the working directory only), so these "
+        "directories are granted through opencode's own permission config, injected per-job "
+        "as an env var and merged over the user's config. Without it, opencode auto-rejects "
+        "every path outside cwd - including STATE_DIR, which silently kills check_notes, "
+        "ask_parent and raise_concern while the job still reports success."
+    )
+    command, prompt, cwd, timeout_seconds, meta = build_opencode_command(args, background=True, add_dirs_override=widened_dirs)
+    return tool_response(launch_command("opencode", command, None, cwd, timeout_seconds, meta=meta, task=task, sandbox_note=sandbox_note, add_dirs=widened_dirs))
 
 
 def continue_opencode_agent(args: dict[str, Any]) -> dict[str, Any]:
@@ -2970,8 +3665,11 @@ def run_kimi(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def launch_kimi(args: dict[str, Any]) -> dict[str, Any]:
-    command, prompt, cwd, timeout_seconds, meta = build_kimi_command(args, background=True)
-    return tool_response(launch_command("kimi", command, None, cwd, timeout_seconds, meta=meta, task=optional_str(args, "prompt")))
+    cwd = resolve_cwd(args)
+    task = optional_str(args, "prompt")
+    widened_dirs, sandbox_note = _prepare_subagent_sandbox(args, cwd, task)
+    command, prompt, cwd, timeout_seconds, meta = build_kimi_command(args, background=True, add_dirs_override=widened_dirs)
+    return tool_response(launch_command("kimi", command, None, cwd, timeout_seconds, meta=meta, task=task, sandbox_note=sandbox_note))
 
 
 def continue_kimi_agent(args: dict[str, Any]) -> dict[str, Any]:
@@ -3080,8 +3778,16 @@ def run_grok(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def launch_grok(args: dict[str, Any]) -> dict[str, Any]:
-    command, prompt, cwd, timeout_seconds, meta = build_grok_command(args, background=True)
-    return tool_response(launch_command("grok", command, None, cwd, timeout_seconds, meta=meta, task=optional_str(args, "prompt")))
+    cwd = resolve_cwd(args)
+    task = optional_str(args, "prompt")
+    widened_dirs, sandbox_note = _prepare_subagent_sandbox(args, cwd, task)
+    sandbox_note["grok_addirs_note"] = (
+        "Grok does not support per-directory sandbox flags (--sandbox accepts a profile "
+        "name, not paths, and --allow controls tool permissions). add_dirs parameters "
+        "could not be applied to the grok command."
+    )
+    command, prompt, cwd, timeout_seconds, meta = build_grok_command(args, background=True, add_dirs_override=widened_dirs)
+    return tool_response(launch_command("grok", command, None, cwd, timeout_seconds, meta=meta, task=task, sandbox_note=sandbox_note))
 
 
 def continue_grok_agent(args: dict[str, Any]) -> dict[str, Any]:
@@ -3209,17 +3915,84 @@ def agent_status(args: dict[str, Any]) -> dict[str, Any]:
         _maybe_enrich(job)
         return tool_response(summarize_job(job))
 
+    # Bare agent_status (no job_id): return a COMPACT per-job summary — job_id, kind,
+    # status, model, elapsed, tokens, files_changed, and the alarm fields (warnings,
+    # suspicious, pending_questions, concerns) — and NEVER inline stdout/stderr. The
+    # full payload is available via agent_status(job_id=...) and raw output via
+    # agent_result. Cap the list at newest-first with a note when truncated.
+    MAX_BARE_JOBS = 100
     with jobs_lock:
-        all_jobs = list(jobs.values())
+        all_jobs = sorted(jobs.values(), key=lambda j: j.started_at, reverse=True)
     for job in all_jobs:
         _maybe_enrich(job)
-    summaries = [summarize_job(job) for job in all_jobs]
-    return tool_response(
-        {
-            "jobs": summaries,
-            "cumulative_tokens": _cumulative_tokens(summaries),
-        }
-    )
+    truncated = len(all_jobs) > MAX_BARE_JOBS
+    listed = all_jobs[:MAX_BARE_JOBS]
+    summaries = [_compact_job_summary(job) for job in listed]
+    result: dict[str, Any] = {
+        "jobs": summaries,
+        "job_count": len(listed),
+        "cumulative_tokens": _cumulative_tokens(
+            [_compact_job_summary(j, force_tokens=True) for j in listed]
+        ),
+    }
+    if truncated:
+        result["truncated"] = True
+        result["truncated_note"] = (
+            f"{len(all_jobs)} total jobs, showing {MAX_BARE_JOBS} newest. "
+            "Use agent_status(job_id=...) for a specific job's full detail."
+        )
+    return tool_response(result)
+
+
+def _compact_job_summary(job: Job, force_tokens: bool = False) -> dict[str, Any]:
+    """A single-line summary for the bare agent_status listing.
+
+    Deliberately omits stdout/stderr — those stay in agent_result. Includes the alarm
+    fields so a parent scanning the list can spot trouble without drilling into each job.
+    """
+    with job.lock:
+        finished_at = job.finished_at
+        elapsed = (finished_at or time.time()) - job.started_at
+        tokens = job.tokens
+        stderr_buf = job.stderr
+    summary: dict[str, Any] = {
+        "job_id": job.id,
+        "kind": job.kind,
+        "status": job.status,
+        "model": job.model,
+        "cwd": job.cwd,
+        "elapsed_seconds": round(elapsed, 1),
+        "returncode": job.returncode,
+    }
+    if force_tokens or tokens:
+        summary["tokens"] = _job_token_summary(tokens)
+    # Alarm fields — these are cheap to compute and are the whole reason bare listing exists.
+    fc = _files_changed(job)
+    if fc is not None:
+        summary["files_changed"] = fc
+    warnings = _scan_stderr_warnings(stderr_buf)
+    if warnings:
+        summary["warnings"] = warnings[:5]  # cap at 5 for the listing
+        summary["warning_count"] = len(warnings)
+    if job.status == "succeeded":
+        susp = _suspicious_check(job)
+        if susp:
+            summary["suspicious"] = susp
+    blocked = pending_questions_for(job.id)
+    if blocked:
+        real = [q for q in blocked if not q.get("auto_rejection_notification")]
+        notifs = [q for q in blocked if q.get("auto_rejection_notification")]
+        if real:
+            summary["pending_questions_count"] = len(real)
+        if notifs:
+            summary["auto_rejection_notifications_count"] = len(notifs)
+    raised = concerns_for(job.id)
+    if raised:
+        summary["concerns_count"] = len(raised)
+        critical = [c for c in raised if c.get("severity") == "critical"]
+        if critical:
+            summary["critical_concerns_count"] = len(critical)
+    return summary
 
 
 def agent_result(args: dict[str, Any]) -> dict[str, Any]:
@@ -3813,7 +4586,9 @@ def peek_agent(args: dict[str, Any]) -> dict[str, Any]:
     with job.lock:
         kind, status, session_id = job.kind, job.status, job.session_id
 
-    # Opencode/Kimi/Grok have no live transcript file; but after finish we have stdout JSONL
+    # Opencode/Kimi/Grok stdout is now streamed incrementally (item 0), so peek works
+    # live while the job is running — no transcript file needed. The cursor contract uses
+    # line indices into the buffered stdout.
     if kind in ("opencode", "kimi", "grok"):
         with job.lock:
             raw = job.stdout or ""
@@ -3822,8 +4597,8 @@ def peek_agent(args: dict[str, Any]) -> dict[str, Any]:
                 "job_id": job_id, "status": status, "events": [], "cursor": since,
                 "note": (
                     f"{kind} job has no stdout yet (still starting) - retry shortly. "
-                    f"Note: {kind} does not write an incremental transcript file, so live peek "
-                    "is limited; after finish, agent_result will have full output."
+                    "Stdout is streamed incrementally, so events will appear as soon as "
+                    "the agent starts writing output."
                 ),
             })
         events: list[dict[str, Any]] = []
@@ -3900,7 +4675,7 @@ def peek_agent(args: dict[str, Any]) -> dict[str, Any]:
             "kind": kind,
             "status": status,
             "session_id": session_id,
-            "transcript": f"{kind} stdout JSONL (no file)",
+            "transcript": f"{kind} stdout buffer (live)",
             "events": events,
             "event_count": len(events),
             "truncated_older": truncated,
@@ -4609,6 +5384,7 @@ def tool_schema() -> list[dict[str, Any]]:
         "type": "string",
         "description": (
             "Optional model override in provider/model format (e.g. meta/muse-spark-1.1, "
+            "deepseek/deepseek-v4-flash for the direct paid DeepSeek Flash API, "
             "opencode/big-pickle, anthropic/claude-opus-4). Opencode supports many providers. "
             "Use a lighter/cheaper model for simple tasks."
         ),
@@ -4710,12 +5486,12 @@ def tool_schema() -> list[dict[str, Any]]:
         },
         {
             "name": "run_opencode_agent",
-            "description": "Run Opencode non-interactively via `opencode run` and wait for completion. Model param uses provider/model format (e.g. meta/muse-spark-1.1, opencode/big-pickle, anthropic/claude-sonnet-4).",
+            "description": "Run Opencode non-interactively via `opencode run` and wait for completion. Model param uses provider/model format (e.g. deepseek/deepseek-v4-flash for paid DeepSeek Flash, meta/muse-spark-1.1, opencode/big-pickle, anthropic/claude-sonnet-4).",
             "inputSchema": opencode_schema,
         },
         {
             "name": "launch_opencode_agent",
-            "description": "Launch Opencode in the background via `opencode run`; poll with agent_status and agent_result. Supports model selection via provider/model.",
+            "description": "Launch Opencode in the background via `opencode run`; poll with agent_status and agent_result. Supports provider/model selection, including deepseek/deepseek-v4-flash for paid DeepSeek Flash.",
             "inputSchema": opencode_schema,
         },
         {

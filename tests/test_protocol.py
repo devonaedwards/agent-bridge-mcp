@@ -10,6 +10,8 @@ rules in particular, where a wrong table name fails SILENTLY).
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -512,7 +514,217 @@ def test_transcript_parsers() -> None:
     check("codex list-shaped output flattened", "DONE" in ab._codex_events(codex_out, True)[0]["summary"])
 
 
+def test_stderr_warnings() -> None:
+    """The stderr warning scanner should find permission/rejection patterns."""
+    print("\nstderr warning scanner")
+    # Basic detection
+    stderr = "auto-rejecting: external_directory (/tmp/secret)"
+    warnings = ab._scan_stderr_warnings(stderr)
+    check("finds auto-reject", len(warnings) > 0)
+    check("includes line text", "auto-reject" in warnings[0]["line"])
+
+    # Dedup: repeated lines should get a count
+    stderr_dup = "permission requested: x\npermission requested: x"
+    dedup = ab._scan_stderr_warnings(stderr_dup)
+    check("dedup by pattern group and normalized line", dedup[0]["count"] == 2)
+
+    # Clean stderr should produce no warnings
+    clean = "Compiled successfully.\nAll tests passed."
+    check("clean stderr has no warnings", len(ab._scan_stderr_warnings(clean)) == 0)
+
+    # Empty stderr
+    check("empty stderr has no warnings", len(ab._scan_stderr_warnings("")) == 0)
+
+    # Multiple pattern groups
+    multi = "permission requested\ndenied: access to /foo\nsandbox violation"
+    multi_warns = ab._scan_stderr_warnings(multi)
+    check("finds multiple distinct patterns", len(multi_warns) >= 3)
+
+
+def test_path_scanner() -> None:
+    """The out-of-sandbox path scanner catches paths outside cwd."""
+    print("\nout-of-sandbox path scanner")
+    cwd = str(Path(__file__).resolve().parent)
+
+    # Absolute path outside cwd (only works if the path exists)
+    import os
+    python_bin = os.path.abspath(sys.executable)
+    prompt_with_path = f"Please read {python_bin} and analyze it"
+    to_add, skipped = ab._scan_prompt_for_outside_paths(prompt_with_path, cwd, [])
+    check("detects absolute outside path", len(to_add) > 0,
+          f"got: {to_add}")
+
+    # ~/ path
+    prompt_tilde = "Check ~/.bashrc"
+    to_add2, _ = ab._scan_prompt_for_outside_paths(prompt_tilde, cwd, [])
+    # ~/.bashrc may not exist, which is fine — the scanner only flags existing paths
+    check("tilde path handled without error", isinstance(to_add2, list))
+
+    # False positive: version strings
+    prompt_version = "Use version 2.0.1 or later"
+    to_add3, _ = ab._scan_prompt_for_outside_paths(prompt_version, cwd, [])
+    check("version strings are not paths", len(to_add3) == 0)
+
+    # False positive: URLs
+    prompt_url = "See https://github.com/foo/bar for docs"
+    to_add4, _ = ab._scan_prompt_for_outside_paths(prompt_url, cwd, [])
+    check("URLs are not paths", len(to_add4) == 0)
+
+    # Empty prompt
+    check("empty prompt safe", len(ab._scan_prompt_for_outside_paths("", cwd, [])[0]) == 0)
+
+
+def test_compact_status() -> None:
+    """Bare agent_status must never inline stdout/stderr."""
+    print("\ncompact agent_status shape")
+    cmd = ["echo", "hello"]
+    proc = subprocess.Popen(
+        cmd, cwd=str(REPO),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    import time as _time
+    import agent_bridge_mcp as _ab
+    job = _ab.Job(
+        id="test-compact-status", kind="test", command=cmd, cwd=str(REPO),
+        timeout_seconds=10, started_at=_time.time(), process=proc,
+    )
+    proc.communicate(timeout=5)
+    job.returncode = proc.returncode
+    job.finished_at = _time.time()
+    job.stdout = "hello world"
+    job.stderr = ""
+    _ab.jobs[job.id] = job
+
+    compact = _ab._compact_job_summary(job)
+    check("compact omits stdout", "stdout" not in compact)
+    check("compact omits stderr", "stderr" not in compact)
+    check("compact has job_id", "job_id" in compact)
+    check("compact has status", "status" in compact)
+    check("compact has elapsed", "elapsed_seconds" in compact)
+    # files_changed is now a dict (Correction 3)
+    fc = compact.get("files_changed")
+    if fc is not None:
+        check("files_changed is dict", isinstance(fc, dict))
+        check("files_changed has files key", "files" in fc)
+
+
+def test_sandbox_widening_reaches_command() -> None:
+    """The sandbox scan must run BEFORE build_* so widened dirs reach the command."""
+    print("\nsandbox widening in command")
+    import os as _os
+    state_dir = str(ab.STATE_DIR.resolve())
+
+    # Claude: STATE_DIR should appear in the --add-dir flags
+    args = {"prompt": "test", "cwd": str(REPO)}
+    widened, _note = ab._prepare_subagent_sandbox(args, ab.resolve_cwd(args), "test")
+    cmd, _, _, _, _ = ab.build_claude_command(args, background=True, add_dirs_override=widened)
+    joined = " ".join(cmd)
+    check("claude --add-dir has STATE_DIR", state_dir in joined,
+          f"STATE_DIR not found in command")
+
+    # Codex: STATE_DIR should appear in --add-dir flags
+    job_id = str(ab.uuid.uuid4())
+    cmd2, _, _, _, _ = ab.build_codex_command(args, background=True, job_id=job_id, add_dirs_override=widened)
+    joined2 = " ".join(cmd2)
+    check("codex --add-dir has STATE_DIR", state_dir in joined2,
+          f"STATE_DIR not found in codex command")
+
+    # Kimi: STATE_DIR should appear in --add-dir flags
+    cmd3, _, _, _, _ = ab.build_kimi_command(args, background=True, add_dirs_override=widened)
+    joined3 = " ".join(cmd3)
+    check("kimi --add-dir has STATE_DIR", state_dir in joined3,
+          f"STATE_DIR not found in kimi command")
+
+    # Opencode: no --add-dir flag, but sandbox_note says so
+    cmd4, _, _, _, _ = ab.build_opencode_command(args, background=True, add_dirs_override=widened)
+    # _prepare_subagent_sandbox still widens but opencode build ignores per the docs
+    check("opencode build does not crash with add_dirs_override", True)
+
+
+def test_buffer_cap() -> None:
+    """The buffer cap must preserve head + tail and never exceed the max."""
+    print("\nbuffer cap")
+    import agent_bridge_mcp as _ab
+    head = "HEAD: " + "x" * (_ab.STREAM_BUFFER_HEAD_CHARS - 6)
+    body = "BODY: " + "z" * (_ab.STREAM_BUFFER_MAX_CHARS * 2)
+    tail = "TAIL: error message at end"
+    huge = head + "\n" + body + "\n" + tail
+
+    capped, dropped = _ab._cap_stream_buffer(huge)
+    check("capped fits within max", len(capped) <= _ab.STREAM_BUFFER_MAX_CHARS,
+          f"got {len(capped)} > {_ab.STREAM_BUFFER_MAX_CHARS}")
+    check("head preserved", "HEAD:" in capped[:200])
+    check("tail preserved", "TAIL:" in capped[-200:])
+
+    # Should not cap a short string
+    short = "short"
+    check("short string unchanged", _ab._cap_stream_buffer(short)[0] == short)
+
+    # The dropped-count must be CUMULATIVE across calls. Line-at-a-time is how the reader
+    # thread actually uses this, and the per-call figure understates the true loss by
+    # orders of magnitude - a marker claiming "221 chars truncated" on a job that really
+    # lost 905,000 reads as "you have basically everything" when you have 18%.
+    buf, dropped = "", 0
+    line = "y" * 220 + "\n"
+    n_lines = 5000
+    for _ in range(n_lines):
+        buf, dropped = _ab._cap_stream_buffer(buf + line, dropped)
+    fed = n_lines * len(line)
+    actually_dropped = fed - len(buf)
+    check("cumulative dropped count is accurate",
+          abs(dropped - actually_dropped) <= 100,
+          f"reported {dropped}, actually dropped {actually_dropped}")
+    marker = re.search(r"\[\.\.\. (\d+) chars truncated", buf)
+    check("marker reports the cumulative figure",
+          marker is not None and abs(int(marker.group(1)) - actually_dropped) <= 100,
+          f"marker says {marker.group(1) if marker else 'NONE'}, actual {actually_dropped}")
+
+
+def test_opencode_permission_env() -> None:
+    """Opencode's STATE_DIR grant rides on an env var, since it has no --add-dir flag."""
+    print("\nopencode sandbox permission")
+    import agent_bridge_mcp as _ab
+
+    raw = _ab.opencode_permission_env([str(_ab.STATE_DIR)])
+    check("returns a config payload", raw is not None)
+    cfg = json.loads(raw)
+    rules = cfg["permission"]["external_directory"]
+    expected = f"{Path(str(_ab.STATE_DIR)).expanduser().resolve()}/**"
+    check("STATE_DIR is allowed", rules.get(expected) == "allow",
+          f"rules were {rules}")
+    check("glob is recursive", all(k.endswith("/**") for k in rules),
+          "nested paths under STATE_DIR (questions/, notes/) are rejected by a /* glob")
+    check("no dirs means no injection", _ab.opencode_permission_env([]) is None)
+
+    # The variable is a general config channel; clobbering an inherited value would
+    # silently drop whatever the parent put there.
+    prior = os.environ.get("OPENCODE_CONFIG_CONTENT")
+    os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps({"model": "someone/else"})
+    try:
+        merged = json.loads(_ab.opencode_permission_env([str(_ab.STATE_DIR)]))
+        check("inherited config keys survive", merged.get("model") == "someone/else")
+        check("permission still applied", "external_directory" in merged.get("permission", {}))
+        os.environ["OPENCODE_CONFIG_CONTENT"] = "{not json"
+        check("malformed inherited value does not raise",
+              _ab.opencode_permission_env([str(_ab.STATE_DIR)]) is not None)
+    finally:
+        if prior is None:
+            os.environ.pop("OPENCODE_CONFIG_CONTENT", None)
+        else:
+            os.environ["OPENCODE_CONFIG_CONTENT"] = prior
+
+    # Only opencode gets the env var; every other client takes a CLI flag.
+    env = _ab.child_env("opencode", job_id="j1", add_dirs=[str(_ab.STATE_DIR)])
+    check("child_env injects for opencode", "OPENCODE_CONFIG_CONTENT" in env)
+    env_claude = _ab.child_env("claude", job_id="j1", add_dirs=[str(_ab.STATE_DIR)])
+    check("child_env does not inject for claude",
+          env_claude.get("OPENCODE_CONFIG_CONTENT") == prior
+          or "OPENCODE_CONFIG_CONTENT" not in env_claude)
+
+
 if __name__ == "__main__":
+    test_opencode_permission_env()
     test_handshake()
     test_registration_parity()
     test_ask_parent_guards()
@@ -526,6 +738,11 @@ if __name__ == "__main__":
     test_preamble_gating_sections()
     test_on_timeout_schema()
     test_transcript_parsers()
+    test_stderr_warnings()
+    test_path_scanner()
+    test_compact_status()
+    test_buffer_cap()
+    test_sandbox_widening_reaches_command()
 
     print()
     if failures:
