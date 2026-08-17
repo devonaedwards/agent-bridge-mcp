@@ -53,6 +53,13 @@ allowlist): `ask_parent` (blocking question), `check_notes` / `send_note`
   STATE_DIR access dies silently — which kills `ask_parent`/`check_notes`
   while the job still reports success. Stage cross-repo specs in-repo, or
   pass `add_dirs`.
+- **Spaced paths** (fixed 2026-08-17): opencode derives permission subjects
+  from shell tokens, so `Astro\ Backups` (escaped) never matched the
+  unescaped grant glob — and a spaced cwd could make a job's own repo look
+  external. The server now grants BOTH spellings of every directory and
+  self-grants a spaced cwd. Continued turns also used to get NO grants at
+  all (report channel dead on turn two); `continue_opencode_agent` now
+  re-grants STATE_DIR + cwd. Takes effect on server restart.
 - **Tool naming differs per client**: Claude/Kimi see
   `mcp__agent-bridge__ask_parent`; codex normalizes to
   `mcp__agent_bridge__ask_parent` (register it under `agent_bridge` there);

@@ -814,7 +814,7 @@ def _scan_prompt_for_outside_paths(
     return to_add, skipped
 
 
-def opencode_permission_env(add_dirs: list[str]) -> str | None:
+def opencode_permission_env(add_dirs: list[str], cwd: str | None = None) -> str | None:
     """Build OPENCODE_CONFIG_CONTENT granting opencode access to `add_dirs`.
 
     Opencode is the one client with no `--add-dir` flag: `opencode run --dir` sets the
@@ -861,18 +861,31 @@ def opencode_permission_env(add_dirs: list[str]) -> str | None:
     if isinstance(external, str):
         return json.dumps(existing) if raw else None
     external = dict(external or {})
-    for directory in add_dirs:
+    # SPACED-PATH TRAP (2026-08-17): opencode derives the permission SUBJECT from
+    # shell tokens in the child's own commands, so a path typed as
+    # `Astro\ Backups` arrives with a literal backslash and never matches the
+    # unescaped glob. Worse, a spaced CWD makes the child's own repo look
+    # external the moment it shells `cd` with an escaped path: two lanes died in
+    # seconds this way while their jobs reported success. Grant BOTH spellings
+    # of every directory, and always include the cwd when it contains a space so
+    # a job can never be locked out of its own tree.
+    grant_dirs = list(add_dirs)
+    if cwd and " " in cwd and cwd not in grant_dirs:
+        grant_dirs.append(cwd)
+    for directory in grant_dirs:
         resolved = str(Path(directory).expanduser().resolve())
         # `/**` rather than `/*`: the rejection is raised for nested paths too
         # (questions/, notes/, concerns/, roster/ all live under STATE_DIR).
         external[f"{resolved}/**"] = "allow"
+        if " " in resolved:
+            external[f"{resolved.replace(' ', chr(92) + ' ')}/**"] = "allow"
     permission["external_directory"] = external
     existing["permission"] = permission
     return json.dumps(existing)
 
 
 def child_env(kind: str, job_id: str | None = None, model: str | None = None,
-              add_dirs: list[str] | None = None) -> dict[str, str]:
+              add_dirs: list[str] | None = None, cwd: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     depth = current_depth()
     env["AGENT_BRIDGE_DEPTH"] = str(depth + 1)
@@ -902,7 +915,7 @@ def child_env(kind: str, job_id: str | None = None, model: str | None = None,
     # matching build_* function. Opencode has no such flag, so its grant is an env var -
     # see opencode_permission_env for why this is the only route.
     if kind == "opencode":
-        config_content = opencode_permission_env(add_dirs or [])
+        config_content = opencode_permission_env(add_dirs or [], cwd=cwd)
         if config_content:
             env["OPENCODE_CONFIG_CONTENT"] = config_content
     return env
@@ -2513,7 +2526,7 @@ def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, 
     process = subprocess.Popen(
         command,
         cwd=cwd,
-        env=child_env(kind, job_id=job_id, model=(meta or {}).get("model"), add_dirs=add_dirs),
+        env=child_env(kind, job_id=job_id, model=(meta or {}).get("model"), add_dirs=add_dirs, cwd=cwd),
         # DEVNULL (never None) when we aren't piping a prompt: None would make the child
         # INHERIT the server's stdin (the JSON-RPC pipe), and a subagent that reads stdin
         # (e.g. `claude --print`) then steals incoming requests, hanging agent_status.
@@ -3603,7 +3616,11 @@ def continue_opencode_agent(args: dict[str, Any]) -> dict[str, Any]:
     completed = subprocess.run(
         command,
         cwd=job_cwd,
-        env=child_env("opencode"),
+        # A continued turn used to get NO grants at all (not even STATE_DIR),
+        # so the report channel and any add_dirs died on the second turn while
+        # the first turn had them - the silent-rejection class again. Re-grant
+        # STATE_DIR and the (possibly spaced) cwd every continue.
+        env=child_env("opencode", add_dirs=[str(STATE_DIR)], cwd=job_cwd),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
