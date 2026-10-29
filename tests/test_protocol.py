@@ -723,7 +723,31 @@ def test_opencode_permission_env() -> None:
           or "OPENCODE_CONFIG_CONTENT" not in env_claude)
 
 
+def test_called_functions_exist() -> None:
+    """Every bare function call resolves. 3a5d215 deleted run_command while all five
+    run_* handlers still called it, and nothing failed until a run_* tool was used."""
+    print("\ncalled functions exist")
+    import ast
+    import builtins
+    tree = ast.parse(Path(ab.__file__).read_text())
+    known = set(dir(builtins)) | set(vars(ab))
+    missing = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        local = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+        local |= {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        local |= {n.name for n in ast.walk(fn) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        local |= {(a.asname or a.name).split(".")[0] for n in ast.walk(fn) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+        for call in ast.walk(fn):
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                if call.func.id not in known and call.func.id not in local:
+                    missing.add(call.func.id)
+    check("no call to an undefined function", not missing, f"undefined: {sorted(missing)}")
+
+
 if __name__ == "__main__":
+    test_called_functions_exist()
     test_opencode_permission_env()
     test_handshake()
     test_registration_parity()
