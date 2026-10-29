@@ -177,9 +177,9 @@ PREAMBLE_SECTIONS: dict[str, str] = {
         "such as Codex/Sol and Claude/Opus, which are peers of each other in both directions - "
         "when a genuinely independent look is worth more than another pass of your own: a second "
         "opinion on a design call, an adversarial read of a conclusion you are not sure of, or a "
-        "check on work where your own blind spot is the risk. What you may NOT do is delegate "
-        "upward to a more capable class than your own; that is escalation wearing the costume of "
-        "offloading, and `escalate_question`/`ask_parent` is the honest way to do it. Keep the "
+        "check on work where your own blind spot is the risk. Sending a piece of work UP to a more "
+        "capable model is not part of this budget; if it is open to you, it is described "
+        "separately below. Keep the "
         "judgement, the design decisions, and the final report for yourself: you remain fully "
         "responsible for the work, including anything a helper got wrong, so check what comes "
         "back rather than passing it through unread - a peer's disagreement is evidence to weigh, "
@@ -194,6 +194,20 @@ PREAMBLE_SECTIONS: dict[str, str] = {
         "or pointed at a different problem than yours, is worse than a fresh one, because its "
         "old framing comes along with it. Warm and relevant beats fresh; warm and irrelevant "
         "does not.\n"
+    ),
+    # The other direction. Gated on its own budget, because it costs real money and the
+    # useful version of it is narrow - one hard question, not the whole task.
+    "specialist": (
+        "You can also hire UPWARD. When a piece of your task is genuinely above your own weight - "
+        "a research question you would otherwise be guessing at, a design or judgement call with "
+        "real consequences, a document or analysis that has to be right - you may launch up to "
+        "{max_escalations} agent(s) on a MORE capable model than your own and give that piece to "
+        "them. Name the model and pass `specialist_reason` saying what you want from them and why "
+        "it needs the stronger model. Treat it exactly like bringing in an expensive specialist: "
+        "hand over one well-framed question along with the context needed to answer it, not your "
+        "whole task; read what comes back critically rather than pasting it through; and expect "
+        "to pay for it, so do not reach for this on work you could do yourself. You remain "
+        "accountable for the result and you still write the final report.\n"
     ),
     # Useless on a one-shot task: there is no phase boundary at which to check.
     "notes": (
@@ -226,7 +240,9 @@ PREAMBLE_SECTIONS: dict[str, str] = {
 
 # Order is fixed regardless of which sections are selected, so the prompt prefix stays
 # stable across launches that share a section set.
-PREAMBLE_ORDER = ["core", "abort", "escalate", "delegate", "notes", "concerns", "standing"]
+PREAMBLE_ORDER = [
+    "core", "abort", "escalate", "delegate", "specialist", "notes", "concerns", "standing",
+]
 # What a caller gets when it asks for the smallest useful preamble.
 MINIMAL_SECTIONS = ["core", "concerns", "standing"]
 
@@ -264,8 +280,11 @@ def select_preamble_sections(
     if not child_can_spawn():
         chosen.discard("escalate")
         chosen.discard("delegate")
+        chosen.discard("specialist")
     if max_helpers() <= 0:
         chosen.discard("delegate")
+    if max_escalations() <= 0:
+        chosen.discard("specialist")
     return [name for name in PREAMBLE_ORDER if name in chosen]
 
 
@@ -424,7 +443,7 @@ def with_ask_parent_preamble(prompt: str, tool_name: str = ASK_PARENT_TOOL,
     preamble = "".join(
         PREAMBLE_SECTIONS[name].format(
             tool=tool_name, notes_tool=notes_tool, max_helpers=max_helpers(),
-            concern_tool=concern_tool, warm_tool=warm_tool)
+            max_escalations=max_escalations(), concern_tool=concern_tool, warm_tool=warm_tool)
         for name in chosen
     ) + "\n"
     if preamble.strip() in prompt:
@@ -466,6 +485,7 @@ class Job:
     # Session/token visibility (additive; populated once known).
     session_id: str | None = None          # codex thread id / claude session id, for resume
     model: str | None = None               # model the subagent ran under, if known
+    specialist_reason: str | None = None   # why a subagent hired this model above its own tier
     tokens: dict[str, Any] | None = None    # per-job token usage (input/output/total/...)
     resume: dict[str, Any] | None = None    # config needed to resume this job's session
     enriched: bool = False                 # token/session enrichment already attempted
@@ -1390,194 +1410,86 @@ def check_notes(args: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Delegation: a subagent may hand work to a model at its own level or below.
+# Delegation: a subagent may hand work to a different model - down, sideways, or up.
 #
-# A depth-limited subagent would otherwise have to do all its own toil while
-# everything above it delegates freely. It can launch helpers of its own - at an
-# equal or lower capability class, and only a couple - so the affordance can't be
-# used to route real work UP to a better model or to fan out without bound. The
-# delegating agent stays accountable for the result either way.
+# DOWNWARD is the everyday case: offload toil to something cheaper. SIDEWAYS, to a
+# peer at the same band (usually another vendor's flagship, e.g. Sol <-> Opus), is
+# for an independent second opinion. Both come out of max_helpers (default 2).
 #
-# Sideways delegation (equal class, usually a different vendor) is deliberately
-# allowed: a second opinion from a peer is the whole point of a bridge between
-# frontier models, and "Sol reviews what Opus wrote" is not an escalation. It is
-# what PEER_MODELS below exists to guarantee.
+# UPWARD is the specialist case. An agent that runs into work genuinely above
+# its own weight - a research question it would otherwise guess at, a design or
+# judgement call with real consequences, a document that has to be right - can
+# hire a MORE capable model for that piece, the way you would put an expensive
+# specialist on one question rather than on the whole project. It is
+# deliberately narrower than downward delegation, because it costs real money:
+# it needs a stated reason and has its own small budget (max_escalations,
+# default 1). The hiring agent still owns the result and still writes the final
+# report - a specialist's answer is an input, not a transfer of accountability.
+#
+# What stays refused either way is unbounded fan-out and unbounded depth, which
+# the two counters and AGENT_BRIDGE_MAX_DEPTH cover.
 # ---------------------------------------------------------------------------
 
-# Most capable first. Claude's ladder is static (see the claude-api skill for the
-# current lineup); codex's is read from its own cache, which already lists models
-# in descending capability, so it doesn't rot when the lineup changes.
-CLAUDE_MODEL_TIERS = [
-    "claude-fable-5",
-    "claude-mythos-5",
-    "claude-opus-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
-]
+# Neither ladder is a hand-maintained list of model ids, because that list rots: the
+# previous one predated claude-opus-5, so an Opus 5 subagent ranked as "unknown" and
+# the direction check silently switched itself off for the model actually in use.
+#
+# Codex ships a models cache in descending capability, so its ladder is read from disk.
+# Claude has no such cache locally and the bridge must not make a network call on a
+# launch, so claude ids are ranked STRUCTURALLY: the FAMILY fixes the tier, the VERSION
+# orders within it. Nothing needs editing when claude-opus-5-2, claude-opus-6 or
+# claude-opus-8-33 ships - they rank themselves.
+#
+# Lower band is more capable. Families change far more slowly than versions, which is
+# what makes this hold; an unrecognized family is reported and left unranked rather
+# than guessed at (see model_rank).
+CLAUDE_FAMILY_BANDS = {
+    "mythos": 0,   # frontier / specialist
+    "fable": 0,
+    "opus": 1,     # strong general-purpose
+    "sonnet": 2,   # mid
+    "haiku": 3,    # cheap
+}
+CHEAPEST_BAND = max(CLAUDE_FAMILY_BANDS.values())
+
 CODEX_MODEL_TIERS_FALLBACK = [
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 ]
-# Opencode can run many providers; we order by known capability - meta's spark at top,
-# then heavier opencode models, then free lightweight ones. The direct, paid DeepSeek
-# Flash endpoint is listed separately from OpenCode's free proxy model so callers can
-# select it unambiguously. Unknown models still work because enforce_delegation allows
-# unknown own_rank but checks requested.
-OPENCODE_MODEL_TIERS = [
-    "meta/muse-spark-1.1",
-    "opencode/big-pickle",
-    "anthropic/claude-opus-4",
-    "anthropic/claude-sonnet-4",
-    "openai/gpt-5",
-    "openai/gpt-4.1",
-    "deepseek/deepseek-v4-flash",
-    "opencode/deepseek-v4-flash-free",
-    "opencode/laguna-s-2.1-free",
-    "opencode/ling-3.0-flash-free",
-    "opencode/mimo-v2.5-free",
-    "opencode/nemotron-3-ultra-free",
-    "opencode/north-mini-code-free",
-    "anthropic/claude-haiku-4",
-]
-# Kimi Code models (k3 is flagship, then k2.5, kimi-for-coding family, etc)
-KIMI_MODEL_TIERS = [
-    "kimi-code/k3",
-    "kimi-code/kimi-for-coding",
-    "kimi-code/kimi-for-coding-highspeed",
-    "kimi-code/kimi-k2.5",
-    "kimi/k2",
-    "kimi/k2-thinking",
-    "moonshot/kimi-k2",
-    "anthropic/claude-opus-4",
-    "anthropic/claude-sonnet-4",
-    "openai/gpt-5",
-    "openai/gpt-4.1",
-    "anthropic/claude-haiku-4",
-]
-# Grok models (grok-4.5 flagship, plus older)
-GROK_MODEL_TIERS = [
-    "grok-4.5",
-    "grok-4.5-build-free",
-    "grok-4",
-    "grok-3",
-    "grok-3-mini",
-    "anthropic/claude-opus-4",
-    "anthropic/claude-sonnet-4",
-    "openai/gpt-5",
-    "openai/gpt-4.1",
-    "anthropic/claude-haiku-4",
-]
+
+# Version standing in for "the latest in this family", so the bare aliases the claude
+# CLI itself accepts (`--model opus`) rank as the newest thing in that family.
+LATEST_VERSION = (10**6,)
+# Versions are zero-padded to a fixed width before comparison. Without it Python
+# compares a short tuple as a PREFIX of a longer one, so (5,) sorts before (5, 1) and
+# claude-fable-5 would outrank claude-fable-5-1.
+VERSION_WIDTH = 4
+CLAUDE_MODEL_RE = re.compile(r"^claude-([a-z]+)((?:-\d+)*)$")
+
 DEFAULT_MAX_HELPERS = 2
+DEFAULT_MAX_ESCALATIONS = 1
+# Shortest reason that can actually say what the specialist is for. A bare "research"
+# tells the human reading agent_status nothing about why the money was spent.
+MIN_SPECIALIST_REASON_CHARS = 20
 
-# ---------------------------------------------------------------------------
-# Cross-vendor capability classes, most capable first.
+# Cross-vendor comparison needs one shared scale, because positions in two separate
+# ladders are not comparable: codex cache index 0 is not "the same capability as"
+# CLAUDE_FAMILY_BANDS 0. Codex ids are placed on the claude bands by NAME, not by cache
+# position - the cache can carry entries that are not capability rungs, and on some
+# installs it omits the flagship altogether. First hit wins, so the cheap suffixes are
+# checked before the family names they share a prefix with (gpt-5.4-mini vs gpt-5.4).
 #
-# Delegation compares CLASSES, not ladder positions. Two ladders' indices are not
-# commensurable - index 0 of the codex ladder is not "the same capability as"
-# index 0 of opencode's - so the old rank<=rank check silently blocked every
-# cross-vendor peer handoff (claude-opus rank 3 vs gpt-5.6-sol rank 0 reads as an
-# escalation) while waving through nonsense in the other direction. Classes are
-# coarse on purpose: the question is only "is this an equal or a lesser model",
-# which is all the delegation rule needs to decide.
-# ---------------------------------------------------------------------------
-CAPABILITY_CLASSES = ["apex", "frontier", "workhorse", "light"]
-CAPABILITY_CLASS_MEMBERS: dict[str, list[str]] = {
-    # Priced and positioned above the frontier tier - not a peer of it.
-    "apex": [
-        "claude-fable-5",
-        "claude-mythos-5",
-    ],
-    # Each vendor's flagship. These are peers of each other; see PEER_MODELS.
-    "frontier": [
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "anthropic/claude-opus-4",
-        "gpt-5.6-sol",
-        "gpt-5.5",
-        "meta/muse-spark-1.1",
-        "opencode/big-pickle",
-        "kimi-code/k3",
-        "grok-4.5",
-    ],
-    # Everyday work: capable, cheaper, not the flagship.
-    "workhorse": [
-        "claude-sonnet-5",
-        "claude-sonnet-4-6",
-        "anthropic/claude-sonnet-4",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.4",
-        "openai/gpt-5",
-        "kimi-code/kimi-for-coding",
-        "kimi-code/kimi-k2.5",
-        "kimi/k2",
-        "kimi/k2-thinking",
-        "moonshot/kimi-k2",
-        "grok-4",
-        "grok-3",
-    ],
-    # Drudgery tier: bulk edits, log scanning, reformatting, repetitive lookups.
-    "light": [
-        "claude-haiku-4-5",
-        "anthropic/claude-haiku-4",
-        "gpt-5.4-mini",
-        "openai/gpt-4.1",
-        "kimi-code/kimi-for-coding-highspeed",
-        "grok-3-mini",
-        "grok-4.5-build-free",
-        "deepseek/deepseek-v4-flash",
-        "opencode/deepseek-v4-flash-free",
-        "opencode/laguna-s-2.1-free",
-        "opencode/ling-3.0-flash-free",
-        "opencode/mimo-v2.5-free",
-        "opencode/nemotron-3-ultra-free",
-        "opencode/north-mini-code-free",
-    ],
-}
-
-# Fallback for a model that isn't in the table - matched against the normalized
-# name, first hit wins. Order matters: "light" is checked first so grok-3-mini
-# lands there rather than in workhorse on the "grok-3" substring, and
-# kimi-for-coding-highspeed doesn't get pulled up by "kimi-for-coding".
-CAPABILITY_CLASS_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
-    ("light", ("-mini", "-nano", "-free", "haiku", "flash", "highspeed", "gpt-4.")),
-    ("apex", ("fable", "mythos")),
-    ("frontier", ("opus", "-sol", "muse-spark", "big-pickle", "grok-4.5")),
-    ("workhorse", ("sonnet", "-terra", "-luna", "gpt-5", "kimi", "grok-")),
-]
-
-# Models the human has declared eligible for bidirectional delegation, so handoffs
-# between them are allowed in BOTH directions no matter how the class table ranks
-# them. This is a routing permission, not a claim that the models have identical
-# capabilities. Keeping it explicit means a lineup change cannot quietly block a
-# deliberate cross-vendor review loop.
-PEER_MODELS: list[set[str]] = [
-    {
-        "gpt-5.6-sol",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-    },
-    {
-        # Direct paid DeepSeek API through OpenCode <-> Claude Code Opus.
-        # The free OpenCode-hosted DeepSeek Flash model is deliberately excluded.
-        "deepseek/deepseek-v4-flash",
-        "opus",  # Claude Code's supported short model selector.
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-    },
+# Only claude and codex are ranked. Opencode, kimi and grok models are unranked: a
+# subagent may still launch them, but the direction check is skipped and the launch is
+# charged to the helper budget.
+CODEX_BAND_PATTERNS: list[tuple[int, tuple[str, ...]]] = [
+    (3, ("-mini", "-nano")),
+    (1, ("-sol", "gpt-5.5")),
+    (2, ("-terra", "-luna", "gpt-5.4")),
 ]
 
 _helpers_launched = 0
-_helpers_lock = threading.Lock()
+_escalations_launched = 0
+_helpers_lock = threading.Lock()  # guards both delegation counters
 
 
 def codex_model_tiers() -> list[str]:
@@ -1586,113 +1498,145 @@ def codex_model_tiers() -> list[str]:
     try:
         models = (json.loads(cache.read_text(encoding="utf-8")) or {}).get("models") or []
         slugs = [m["slug"] for m in models if isinstance(m, dict) and m.get("slug")]
-        # Drop non-agent entries like codex-auto-review, which aren't a capability tier.
-        slugs = [s for s in slugs if not s.startswith("codex-")]
+        # Drop entries that are not a capability tier: codex-auto-review and friends, and
+        # gpt-reserve (spare capacity, not a rung). Left in, gpt-reserve sorts to the head
+        # of the cache and outranks gpt-5.6-sol, which quietly inverts the direction check.
+        slugs = [s for s in slugs if not s.startswith("codex-") and s != "gpt-reserve"]
         return slugs or CODEX_MODEL_TIERS_FALLBACK
     except (OSError, json.JSONDecodeError, KeyError):
         return CODEX_MODEL_TIERS_FALLBACK
 
 
 def _normalize_model(model: str) -> str:
-    """Strip context-window and date suffixes so aliases compare equal."""
+    """Strip context-window and date suffixes so aliases of one model compare equal."""
     model = model.strip().lower()
     for suffix in ("[1m]", "[200k]"):
         model = model.replace(suffix, "")
-    return model.strip()
+    # Dated snapshot ids (claude-haiku-4-5-20251001) are the same rung as the base id;
+    # left on, the date parses as another version segment and outranks everything.
+    return re.sub(r"-\d{8}$", "", model.strip())
 
 
-def _opencode_model_tiers() -> list[str]:
-    return OPENCODE_MODEL_TIERS
+def parse_claude_model(model: str | None) -> tuple[str, tuple[int, ...]] | None:
+    """Split a claude id into (family, version). None if it isn't one.
 
-def _kimi_model_tiers() -> list[str]:
-    return KIMI_MODEL_TIERS
-
-def _grok_model_tiers() -> list[str]:
-    return GROK_MODEL_TIERS
-
-def model_rank(kind: str, model: str | None) -> int | None:
-    """Position in the capability ladder; lower is more capable. None if unknown."""
-    if not model:
-        return None
-    tiers = model_rank_ladder(kind)
-    target = _normalize_model(model)
-    for index, known in enumerate(tiers):
-        known_norm = _normalize_model(known)
-        if target == known_norm or target.startswith(known_norm) or known_norm.startswith(target):
-            return index
-    # For opencode, also try substring match on model family (e.g. "opus", "sonnet", "haiku", "gpt-4", "mini", "flash")
-    # so that provider/model strings like "anthropic/claude-opus-4-6" still rank.
-    # If still unknown, return None and caller allows with log.
-    return None
-
-
-def capability_class(model: str | None) -> int | None:
-    """Index into CAPABILITY_CLASSES; lower is more capable. None if unclassifiable.
-
-    Vendor-agnostic by design - the caller does not have to know which client a
-    model belongs to, which is what makes an equal-class comparison across two
-    different vendors' ladders meaningful.
+    Accepts `claude-opus-4-8`, `claude-fable-5-1`, a future `claude-opus-8-33`, and the
+    bare family aliases the CLI takes (`opus`), which mean "latest in that family".
     """
     if not model:
         return None
     target = _normalize_model(model)
-    # LONGEST match wins, not first. A cheap variant shares its family's prefix -
-    # grok-3-mini starts with grok-3, gpt-5.4-mini with gpt-5.4,
-    # kimi-for-coding-highspeed with kimi-for-coding - so a first-hit scan in class
-    # order would promote every one of them into the tier above the right one, which
-    # is the direction that matters: it would let a light helper pass as a workhorse.
-    best_index, best_len = None, -1
-    for index, name in enumerate(CAPABILITY_CLASSES):
-        for known in CAPABILITY_CLASS_MEMBERS[name]:
-            known_norm = _normalize_model(known)
-            if target.startswith(known_norm) and len(known_norm) > best_len:
-                best_index, best_len = index, len(known_norm)
-    if best_index is not None:
-        return best_index
-    for name, needles in CAPABILITY_CLASS_PATTERNS:
-        if any(needle in target for needle in needles):
-            return CAPABILITY_CLASSES.index(name)
+    if target in CLAUDE_FAMILY_BANDS:
+        return target, LATEST_VERSION
+    match = CLAUDE_MODEL_RE.match(target)
+    if not match:
+        return None
+    family, version = match.group(1), match.group(2)
+    if not version:
+        return None
+    return family, tuple(int(part) for part in version.strip("-").split("-"))
+
+
+def model_rank(kind: str, model: str | None) -> tuple[int, ...] | None:
+    """Sort key for capability; SMALLER is more capable. None if unrankable.
+
+    Opaque and only comparable within one kind - use capability_delta, which picks the
+    right scale. Claude's key is (band, negated version) so a newer version of a family
+    outranks an older one with no list to maintain; codex's is its cache position.
+    """
+    if not model:
+        return None
+    if kind == "claude":
+        parsed = parse_claude_model(model)
+        if parsed is None:
+            return None
+        family, version = parsed
+        band = CLAUDE_FAMILY_BANDS.get(family)
+        if band is None:
+            # A genuinely new family name cannot be placed by inspection, and guessing a
+            # tier is worse than admitting it. Unranked means "direction unknown", which
+            # is permissive, so this costs nobody their launch - but say it loudly, since
+            # the fix is one entry in CLAUDE_FAMILY_BANDS.
+            log(f"model_rank: unknown claude family {family!r} in {model!r} - "
+                f"add it to CLAUDE_FAMILY_BANDS (known: {', '.join(CLAUDE_FAMILY_BANDS)})")
+            return None
+        padded = (version + (0,) * VERSION_WIDTH)[:VERSION_WIDTH]
+        return (band, *(-part for part in padded))
+    if kind != "codex":
+        return None
+    target = _normalize_model(model)
+    for index, known in enumerate(codex_model_tiers()):
+        if target == known or target.startswith(known):
+            return (index,)
     return None
 
 
-def are_peers(one: str | None, other: str | None) -> bool:
-    """Has the human declared these two models equivalent? (Sol <-> Opus, etc.)"""
-    if not one or not other:
-        return False
-    left, right = _normalize_model(one), _normalize_model(other)
+def capability_band(kind: str, model: str | None) -> int | None:
+    """Coarse cross-vendor band; lower is more capable. None if unrankable.
 
-    def in_group(model: str, group: set[str]) -> bool:
-        return any(model == _normalize_model(m) or model.startswith(_normalize_model(m))
-                   for m in group)
-
-    return any(in_group(left, group) and in_group(right, group) for group in PEER_MODELS)
-
-
-def sideways_or_cheaper(kind: str, model: str) -> list[str]:
-    """Example models a subagent on `model` may hand work to, for error messages."""
-    own_class = capability_class(model)
-    ladder = model_rank_ladder(kind)
-    allowed = [m for m in ladder
-               if are_peers(model, m)
-               or (own_class is not None and (capability_class(m) or 0) >= own_class)]
-    # Prefer the cheap end - that is what delegation is usually for.
-    return allowed[-2:] if allowed else ladder[-2:]
-
-
-def model_rank_ladder(kind: str) -> list[str]:
-    """The known model list for one client, most capable first."""
+    Positions in two separate per-vendor ladders are not comparable to each other - one
+    ladder's index 6 is not "below" the other's index 5, they are just integers. This is
+    the shared scale a claude<->codex comparison uses instead: claude from the family,
+    codex from CODEX_BAND_PATTERNS. Other kinds are unranked.
+    """
+    if not model:
+        return None
     if kind == "claude":
-        return CLAUDE_MODEL_TIERS
+        parsed = parse_claude_model(model)
+        return None if parsed is None else CLAUDE_FAMILY_BANDS.get(parsed[0])
     if kind == "codex":
-        return codex_model_tiers()
-    if kind == "opencode":
-        return OPENCODE_MODEL_TIERS
-    if kind == "kimi":
-        return KIMI_MODEL_TIERS
-    if kind == "grok":
-        return GROK_MODEL_TIERS
-    return (CLAUDE_MODEL_TIERS + codex_model_tiers() + OPENCODE_MODEL_TIERS
-            + KIMI_MODEL_TIERS + GROK_MODEL_TIERS)
+        target = _normalize_model(model)
+        for band, needles in CODEX_BAND_PATTERNS:
+            if any(needle in target for needle in needles):
+                return band
+    return None
+
+
+def capability_delta(
+    own_kind: str, own_model: str | None, requested_kind: str, requested_model: str | None
+) -> int | None:
+    """How the requested model compares to yours: >0 more capable, <0 less, 0 equal.
+
+    Within one vendor the fine-grained ladder decides, so opus-5 -> opus-4-7 still reads
+    as downward. Across vendors, or when a codex model is missing from the local cache,
+    only the coarse bands mean anything. None when either model is unrankable on the
+    scale that applies - the caller must not guess a direction from that.
+    """
+    own = requested = None
+    if own_kind == requested_kind:
+        own = model_rank(own_kind, own_model)
+        requested = model_rank(requested_kind, requested_model)
+    if own is None or requested is None:
+        own = capability_band(own_kind, own_model)
+        requested = capability_band(requested_kind, requested_model)
+    if own is None or requested is None:
+        return None
+    # Both scales are most-capable-first, so a SMALLER key is a MORE capable model.
+    if own == requested:
+        return 0
+    return 1 if requested < own else -1
+
+
+def cheap_models_hint(kind: str) -> str:
+    """The cheap end of a ladder, named the way the CLI will accept it."""
+    if kind == "claude":
+        families = sorted(CLAUDE_FAMILY_BANDS, key=lambda f: -CLAUDE_FAMILY_BANDS[f])[:2]
+        return " or ".join(f"`{family}`" for family in families)
+    if kind == "codex":
+        return " or ".join(f"`{slug}`" for slug in codex_model_tiers()[-2:])
+    return "a model you know to be cheaper than your own"
+
+
+def model_naming_hint(kind: str) -> str:
+    """How to name a model this bridge can rank - shape for claude, list for codex."""
+    if kind == "claude":
+        families = sorted(CLAUDE_FAMILY_BANDS, key=lambda f: CLAUDE_FAMILY_BANDS[f])
+        return (
+            "Name it as `claude-<family>-<version>` (e.g. `claude-opus-5`, "
+            "`claude-haiku-4-5`) or as a bare family alias meaning the latest in that "
+            f"family. Families, most capable first: {', '.join(families)}."
+        )
+    return f"Name a model from the known ladder: {', '.join(codex_model_tiers())}"
 
 
 def max_helpers() -> int:
@@ -1702,68 +1646,98 @@ def max_helpers() -> int:
         return DEFAULT_MAX_HELPERS
 
 
-def enforce_delegation(kind: str, requested_model: str | None) -> None:
-    """Gate a subagent launching its own helper. No-op for a top-level agent.
+def max_escalations() -> int:
+    try:
+        return max(
+            0, int(os.environ.get("AGENT_BRIDGE_MAX_ESCALATIONS", str(DEFAULT_MAX_ESCALATIONS)))
+        )
+    except ValueError:
+        return DEFAULT_MAX_ESCALATIONS
+
+
+def enforce_delegation(
+    kind: str, requested_model: str | None, specialist_reason: str | None = None
+) -> None:
+    """Gate a subagent launching another agent. No-op for a top-level agent.
 
     Top-level launches are the human's call and stay unrestricted. A subagent
-    (AGENT_BRIDGE_JOB_ID is set) may delegate DOWN a capability class or SIDEWAYS
-    within one - including across vendors, which is how Sol hands work to Opus and
-    Opus hands work to Sol - and only a bounded number of times. Delegating UP is
-    still refused: that is escalation dressed as offloading, and the point of the
-    cap is that the delegating agent stays accountable for the result.
+    (AGENT_BRIDGE_JOB_ID is set) gets two separate, bounded budgets: helpers at or
+    below its own tier (cheaper toil, or a peer's second opinion), and a smaller
+    allowance for hiring a specialist above it.
     """
     if not os.environ.get("AGENT_BRIDGE_JOB_ID"):
         return
 
+    if not requested_model:
+        raise ValueError(
+            "as a subagent you must name the `model` you are launching. Send drudgery "
+            "(mechanical edits, bulk reads, formatting, log scanning) DOWN to a cheaper "
+            f"model - for {kind} the cheap end is {cheap_models_hint(kind)}. To send one "
+            "hard piece UP to a more capable model, name it and pass `specialist_reason`."
+        )
+    ranked_kind = kind in ("claude", "codex")
+    if ranked_kind and model_rank(kind, requested_model) is None \
+            and capability_band(kind, requested_model) is None:
+        raise ValueError(
+            f"unknown model '{requested_model}' - cannot place it against your own tier. "
+            f"{model_naming_hint(kind)}"
+        )
+
+    own_model = os.environ.get("AGENT_BRIDGE_MODEL")
+    own_kind = os.environ.get("AGENT_BRIDGE_PARENT", kind)
+    delta = capability_delta(own_kind, own_model, kind, requested_model)
+    if delta is None:
+        # Can't prove which way this goes. Allow it - the helper cap still bounds the blast
+        # radius - but charge it to the cheaper budget and say so in the log.
+        log(
+            f"delegation: cannot rank {own_model!r} ({own_kind}) against "
+            f"{requested_model!r} ({kind}); direction check skipped"
+        )
+    # Equal is SIDEWAYS - a peer's second opinion - and comes out of the helper budget.
+    upward = delta is not None and delta > 0
+
+    if upward:
+        allowed = max_escalations()
+        with _helpers_lock:
+            already = _escalations_launched
+        if allowed <= 0:
+            raise RuntimeError(
+                "hiring a more capable model is disabled here (AGENT_BRIDGE_MAX_ESCALATIONS=0). "
+                "Do the work yourself, or ask_parent whether it wants to run this piece on a "
+                "stronger model itself."
+            )
+        if already >= allowed:
+            raise RuntimeError(
+                f"specialist limit reached: you have already hired {already} agent(s) "
+                f"above your own tier, the maximum is {allowed}. A specialist is for the one "
+                "piece genuinely above your weight, not for the whole task - do the rest "
+                "yourself, or ask_parent if this really needs another."
+            )
+        reason = (specialist_reason or "").strip()
+        if len(reason) < MIN_SPECIALIST_REASON_CHARS:
+            raise ValueError(
+                f"'{requested_model}' is above your own tier ({own_model}), so this is "
+                "hiring a specialist rather than offloading toil. That is allowed, but pass "
+                "`specialist_reason` saying what you want from them and why it needs the "
+                "stronger model - at least "
+                f"{MIN_SPECIALIST_REASON_CHARS} characters. Hand over one well-framed "
+                "question with the context to answer it, not your whole task: you still own "
+                "the result and still write the final report."
+            )
+        with _helpers_lock:
+            globals()["_escalations_launched"] = already + 1
+        log(f"delegation: hired {requested_model} ({kind}) above {own_model!r} - {reason}")
+        return
+
+    allowed = max_helpers()
     with _helpers_lock:
         already = _helpers_launched
-    allowed = max_helpers()
     if already >= allowed:
         raise RuntimeError(
             f"delegation limit reached: you have already launched {already} helper agent(s), "
             f"the maximum is {allowed}. Do the remaining work yourself, or ask your parent "
             "(ask_parent) if the task genuinely needs more delegation than that."
         )
-
-    own_model = os.environ.get("AGENT_BRIDGE_MODEL")
-    if not requested_model:
-        raise ValueError(
-            "as a subagent you must name the `model` you are delegating to. It may be at "
-            "your own level (a peer - e.g. a cross-vendor second opinion) or below it, but "
-            "not above. Delegate drudgery (mechanical edits, bulk reads, formatting, log "
-            f"scanning) to a cheaper model - for {kind} you could use "
-            f"{', '.join(sideways_or_cheaper(kind, own_model or ''))}."
-        )
-
-    # A model unknown to BOTH the ladder and the class table can't be reasoned
-    # about at all - refuse rather than wave it through on a typo.
-    requested_class = capability_class(requested_model)
-    if model_rank(kind, requested_model) is None and requested_class is None:
-        raise ValueError(
-            f"unknown model '{requested_model}' - cannot confirm it is at or below your own "
-            f"level. Name a model from the known ladder: "
-            f"{', '.join(model_rank_ladder(kind))}"
-        )
-
-    own_class = capability_class(own_model)
-    if are_peers(own_model, requested_model):
-        # Declared equivalent by the human. Sideways by definition, both ways.
-        log(f"delegation: {own_model!r} -> {requested_model!r} allowed as declared peers")
-    elif own_class is None or requested_class is None:
-        # Can't prove the direction. Allow it - the count cap still bounds the
-        # blast radius - but leave a trail saying the check was skipped.
-        log(f"delegation: cannot class {own_model!r} or {requested_model!r}; "
-            "direction check skipped")
-    elif requested_class < own_class:
-        raise RuntimeError(
-            f"you may delegate SIDEWAYS or DOWNWARD, not upward. You are running "
-            f"{own_model} ({CAPABILITY_CLASSES[own_class]}); '{requested_model}' is "
-            f"{CAPABILITY_CLASSES[requested_class]}, a more capable class, so this would "
-            "escalate rather than offload. Pick a peer at your own level or a cheaper model "
-            f"({', '.join(sideways_or_cheaper(kind, own_model or ''))}), and keep the "
-            "judgement calls yourself - you remain responsible for the result either way."
-        )
-
     with _helpers_lock:
         globals()["_helpers_launched"] = already + 1
 
@@ -1850,6 +1824,7 @@ def build_codex_command(
     meta = {
         "session_persist": not ephemeral,
         "model": model,
+        "specialist_reason": optional_str(args, "specialist_reason"),
         "resume": {"sandbox": sandbox, "approval_policy": approval_policy, "cwd": cwd},
     }
     return command, prompt, cwd, timeout_seconds, meta
@@ -1951,6 +1926,7 @@ def build_claude_command(args: dict[str, Any], background: bool = False, add_dir
     meta = {
         "session_persist": not no_session_persistence,
         "model": model,
+        "specialist_reason": optional_str(args, "specialist_reason"),
         # Session id is known up-front only when we persist (we passed --session-id).
         "session_id": None if no_session_persistence else session_id,
     }
@@ -2517,8 +2493,9 @@ def git_commit_paths(cwd: str, paths: list[str], message: str) -> dict[str, Any]
 
 def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, commit_paths: list[str] | None = None, commit_message: str | None = None, meta: dict[str, Any] | None = None, job_id: str | None = None, task: str | None = None, sandbox_note: dict[str, Any] | None = None, add_dirs: list[str] | None = None) -> dict[str, Any]:
     enforce_depth()
-    enforce_delegation(kind, (meta or {}).get("model"))
-
+    enforce_delegation(
+        kind, (meta or {}).get("model"), (meta or {}).get("specialist_reason")
+    )
     # The job id reaches the child so ask_parent can address questions back at this job.
     # Callers that must bake it into the command itself (launch_codex, via -c env
     # overrides) generate it first and pass it in; otherwise make one here.
@@ -2550,6 +2527,7 @@ def launch_command(kind: str, command: list[str], prompt: str | None, cwd: str, 
         # For codex the id is discovered from stdout/rollout once the job finishes.
         session_id=meta.get("session_id"),
         model=meta.get("model"),
+        specialist_reason=meta.get("specialist_reason"),
         resume=meta.get("resume"),
         # Kept so a warm agent is identifiable later by what it was working on -
         # "which of these six sessions knows the auth refactor" is unanswerable from
@@ -3234,6 +3212,7 @@ def summarize_job(job: Job) -> dict[str, Any]:
         kind = job.kind
         session_id = job.session_id
         model = job.model
+        specialist_reason = job.specialist_reason
         tokens = job.tokens
         stderr_buf = job.stderr
         stdout_buf = job.stdout
@@ -3256,6 +3235,8 @@ def summarize_job(job: Job) -> dict[str, Any]:
 
     summary["session_id"] = session_id
     summary["tokens"] = _job_token_summary(tokens)
+    if specialist_reason:
+        summary["specialist_reason"] = specialist_reason
 
     # ---- Item 1: warnings[] from stderr scanning ----
     # Must work while the job is still RUNNING — that's the whole point. The streaming
@@ -3509,7 +3490,7 @@ def run_command(kind: str, command: list[str], prompt: str | None, cwd: str, tim
 
 def run_codex(args: dict[str, Any]) -> dict[str, Any]:
     command, prompt, cwd, timeout_seconds, meta = build_codex_command(args)
-    enforce_delegation("codex", meta.get("model"))
+    enforce_delegation("codex", meta.get("model"), meta.get("specialist_reason"))
     max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
     result = run_command("codex", command, prompt, cwd, timeout_seconds, max_output_chars)
     commit_paths = optional_string_list(args, "commit_paths")
@@ -3538,7 +3519,7 @@ def launch_codex(args: dict[str, Any]) -> dict[str, Any]:
 
 def run_claude(args: dict[str, Any]) -> dict[str, Any]:
     command, prompt, cwd, timeout_seconds, meta = build_claude_command(args)
-    enforce_delegation("claude", meta.get("model"))
+    enforce_delegation("claude", meta.get("model"), meta.get("specialist_reason"))
     max_output_chars = optional_int(args, "max_output_chars", DEFAULT_MAX_OUTPUT_CHARS, 1000, 2_000_000)
     result = run_command("claude", command, None if command[-1] != "-" else prompt, cwd, timeout_seconds, max_output_chars)
     enrich_sync_result("claude", result, meta)
@@ -5293,18 +5274,31 @@ def tool_schema() -> list[dict[str, Any]]:
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "enum": ["core", "abort", "escalate", "delegate", "notes", "concerns", "standing"],
+                    "enum": [
+                        "core", "abort", "escalate", "delegate", "specialist", "notes",
+                        "concerns", "standing",
+                    ],
                 },
                 "description": (
                     "Advanced: trim the subagent's briefing to these sections. Omit for automatic "
                     "selection, which is what you want almost always. 'core' (the question "
                     "channel), 'concerns' and 'standing' are cheap and broadly useful; 'abort' "
                     "matters when a wrong guess is destructive; 'notes' only on multi-phase work. "
-                    "'escalate' and 'delegate' are dropped automatically when the subagent would "
-                    "be at the recursion ceiling and so cannot launch anything."
+                    "'escalate', 'delegate' and 'specialist' are dropped automatically when the "
+                    "subagent would be at the recursion ceiling and so cannot launch anything, "
+                    "and 'specialist' also when its budget is zero."
                 ),
             },
             "model": {"type": "string", "description": "Optional model override."},
+            "specialist_reason": {
+                "type": "string",
+                "description": (
+                    "Required only when you are a SUBAGENT launching an agent on a claude or codex "
+                    "model above your own capability tier - hiring a specialist rather than offloading toil. Say "
+                    "what you want from them and why it needs the stronger model. Ignored for "
+                    "top-level launches, cheaper helpers and same-tier peers."
+                ),
+            },
             "timeout_seconds": {
                 "type": "integer",
                 "minimum": 1,

@@ -102,41 +102,99 @@ The distinction from `ask_parent` matters: a question blocks because the agent n
 answer to continue. A concern does not. An agent that cannot safely proceed should ask,
 with `on_timeout="abort"`.
 
-## Delegating: downward and sideways
+## Delegating down, sideways, and hiring up
 
-A subagent can launch helpers of its own - either **downward** to a cheaper model for
-toil (bulk mechanical edits, log scanning, reformatting) or **sideways** to a peer at
-its own level for an independent look (a second opinion on a design call, an
-adversarial read of a shaky conclusion):
+A subagent can launch agents of its own downward, sideways, or upward. All three are
+bounded and all require it to **name the model**. An unnamed model is refused, and so is
+a claude or codex id the bridge cannot place on either scale below.
+Top-level launches (yours) are unrestricted - the limits apply only to subagents.
 
-- **Downward or sideways only.** Upward is refused - it is escalation dressed as
-  offloading, and `escalate_question` / `ask_parent` is the honest way to do that.
-- It must **name the model** explicitly; an unnamed model is refused, and so is one
-  unknown to both the ladder and the capability-class table.
-- At most **2 helpers** per subagent (`AGENT_BRIDGE_MAX_HELPERS` to change).
-- Top-level launches (yours) are unrestricted - the limits apply only to subagents.
+**Down - drudgery to a cheaper model.** Bulk mechanical edits, log scanning,
+reformatting, repetitive lookups.
 
-The delegating agent stays responsible for the result, including anything a helper got
-wrong, and is told so. A peer's disagreement is evidence to weigh, not a verdict that
-overrides it.
+**Sideways - a peer at the same tier.** An independent look: a second opinion on a
+design call, or an adversarial read of a conclusion the agent is unsure of. Codex/Sol
+and Claude/Opus sit in the same band, so either can ask the other to review its work.
+A peer's disagreement is evidence to weigh, not a verdict that overrides the agent.
 
-**Sideways is why the bridge exists.** Codex/Sol and Claude/Opus are declared peers in
-both directions, so either can ask the other to review its work:
+Down and sideways share one budget: up to **2 helpers** per subagent
+(`AGENT_BRIDGE_MAX_HELPERS`). Neither needs a reason.
+
+**Up - a hard piece to a more capable one.** The in-house-specialist model: an agent that
+runs into a research question it would be guessing at, a design or judgement call with
+real consequences, or writing that has to be right can put a stronger model on that
+piece. It costs real money, so it is deliberately narrower than delegating down:
+
+- It must pass **`specialist_reason`** - what it wants from the specialist and why the
+  stronger model is needed. A token reason is refused; this is what the human sees in
+  `agent_status` next to the bill.
+- **1 specialist** per subagent by default (`AGENT_BRIDGE_MAX_ESCALATIONS`; `0` disables
+  hiring up entirely).
+
+The two budgets are independent, so spending helpers doesn't cost specialists. Either
+way the launching agent stays responsible for the result, including anything that came
+back wrong, and writes the final report itself. It is told so.
+
+### How models are ranked
+
+**Neither ladder is a list of model ids to keep up to date.** The previous one was, and
+it rotted: written before `claude-opus-5` shipped, it ranked an Opus 5 subagent as
+"unknown", which silently switched the direction check off for the model actually in
+use. Both sides now derive their ordering.
+
+**Codex** reads `~/.codex/models_cache.json`, which lists models in descending
+capability, so it tracks the lineup on its own. Entries that aren't a capability rung
+(`codex-auto-review`, `gpt-reserve` - spare capacity, not a tier) are dropped.
+
+**Claude** has no such cache locally, and the bridge must not make a network call to
+launch an agent, so claude ids are ranked structurally: the **family** fixes the tier,
+the **version** orders within it.
 
 ```
-sol -> opus     allowed (peers)
-opus -> sol     allowed (peers)
-opus -> haiku   allowed (downward)
-opus -> fable   refused (apex is a more capable class)
-sonnet -> sol   refused (frontier is a more capable class)
+family:   mythos = fable  >  opus  >  sonnet  >  haiku
+version:  numeric, per segment - 4.10 > 4.8, and 5-1 > 5
 ```
 
-Direction comes from cross-vendor **capability class** (`apex > frontier > workhorse >
-light`), not ladder position - two vendors' ladder indices aren't comparable, and
-treating them as if they were is what used to block every peer handoff. Class tables
-and the per-vendor ladders are in `agent_bridge_mcp.py`; codex's ladder is read from
-`~/.codex/models_cache.json`, which already lists models in descending capability, so
-it tracks the lineup automatically.
+So `claude-opus-5-2`, `claude-opus-6` and `claude-opus-8-33` all rank themselves the day
+they ship, with nothing here to edit. Dated snapshots (`claude-haiku-4-5-20251001`) and
+context suffixes (`[1m]`) rank as the base model, and the bare aliases the CLI itself
+takes (`--model opus`) mean "latest in that family".
+
+The one thing that still needs a human is a genuinely **new family name**. Capability
+can't be inferred from a word, so an unrecognized family is left unranked and logged
+with the fix (`add it to CLAUDE_FAMILY_BANDS`) rather than guessed at. Unranked is the
+permissive outcome - the launch goes ahead, charged to the helper budget - so a new
+family costs a log line, not a blocked agent.
+
+**Across vendors** the two ladders aren't comparable to each other: one's index 6 is not
+"below" the other's index 5, they are just integers. A claude<->codex comparison uses
+the coarse shared bands instead. Claude's band comes from the family. Codex's comes
+from the model name (`CODEX_BAND_PATTERNS`), not its cache position, because the cache
+can carry entries that are not rungs and on some installs omits Sol entirely:
+
+```
+0  fable, mythos
+1  opus,   gpt-5.6-sol, gpt-5.5
+2  sonnet, terra, luna, gpt-5.4
+3  haiku,  -mini / -nano
+```
+
+For example:
+
+```
+sol -> opus      sideways (helper budget)
+opus -> sol      sideways (helper budget)
+opus -> haiku    downward (helper budget)
+opus -> fable    upward (specialist budget, needs specialist_reason)
+sonnet -> sol    upward (specialist budget, needs specialist_reason)
+```
+
+Within one vendor the fine-grained key still decides, so `opus-5 -> opus-4-7` is still
+downward. A codex model missing from the local cache falls back to its band.
+
+Only claude and codex are ranked. Opencode, kimi and grok models are unranked: the
+launch is allowed, logged, and charged to the helper budget. The same applies to any
+model whose direction can't be worked out.
 
 ## Reusing a warm agent instead of launching a fresh one
 
@@ -161,14 +219,17 @@ resumable by hand.
 ## Trimming the subagent briefing
 
 Every background launch prepends a briefing covering the question channel, aborting,
-escalation, notes, delegation, concerns, and the agent's standing to ask for context.
+escalation, notes, delegating down, hiring up, concerns, and the agent's standing to ask
+for context.
 Each section earned its place from an observed failure, but sending all of them every
 time dilutes the ones that matter for the task in hand.
 
 **Structural gating is automatic and not overridable.** A subagent at the recursion
-ceiling cannot launch anything, so the `escalate` and `delegate` sections are dropped -
-telling it otherwise advertises a door that is locked. Same when `AGENT_BRIDGE_MAX_HELPERS`
-is 0. A caller cannot re-enable these; the gate wins over an explicit section list.
+ceiling cannot launch anything, so the `escalate`, `delegate` and `specialist` sections
+are dropped - telling it otherwise advertises a door that is locked. Same for `delegate`
+when `AGENT_BRIDGE_MAX_HELPERS` is 0, and for `specialist` when
+`AGENT_BRIDGE_MAX_ESCALATIONS` is 0. A caller cannot re-enable these; the gate wins over
+an explicit section list.
 
 **Caller controls:**
 
@@ -179,7 +240,7 @@ launch_claude_agent(prompt=..., preamble_sections=[...])    # advanced: exact se
 
 `multi_phase=False` is the one worth reaching for: a one-shot job finishes before it
 would ever hit a phase boundary, so the note channel is pure overhead. Sections are
-`core`, `abort`, `escalate`, `delegate`, `notes`, `concerns`, `standing`; omit
+`core`, `abort`, `escalate`, `delegate`, `specialist`, `notes`, `concerns`, `standing`; omit
 `preamble_sections` for automatic selection, which is right almost always.
 
 Observed: a trimmed briefing (`core` + `concerns` + `standing`, single-phase — 44%
