@@ -123,6 +123,9 @@ against codex-cli 0.144.6; four things there are load-bearing:
 - `AGENT_BRIDGE_MAX_DEPTH=2` prevents unbounded Claude-to-Codex-to-Claude loops.
   Set a larger value in the MCP server environment only when deeper delegation is
   intentional.
+- A subagent may launch `AGENT_BRIDGE_MAX_HELPERS=2` agents below its own capability
+  tier, and hire `AGENT_BRIDGE_MAX_ESCALATIONS=1` at or above it (that one needs a
+  `specialist_reason`). See [USAGE.md](USAGE.md) - "Delegating down, and hiring up".
 - Override binary paths with `CODEX_BIN` or `CLAUDE_BIN` if needed.
 
 ## Example Prompt
