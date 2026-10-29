@@ -112,8 +112,10 @@ Sections live in `PREAMBLE_SECTIONS` and are assembled per launch by
 fixed regardless of selection, so a shared section set produces a stable prompt prefix),
 and decide its gate.
 
-Prefer a **structural** gate over a heuristic one. `escalate` and `delegate` are gated on
-`child_can_spawn()` — derived from depth and config, provable, and it can't drift. Do not
+Prefer a **structural** gate over a heuristic one. `escalate`, `delegate` and
+`specialist` are gated on `child_can_spawn()` — derived from depth and config, provable,
+and it can't drift; `delegate` and `specialist` are additionally gated on their own
+budgets being non-zero. Do not
 gate by inspecting the prompt text: that is the same guess-at-the-environment pattern that
 produced the "advertised a tool that wasn't registered" bugs. If a section can't be gated
 structurally, expose a caller flag instead (`multi_phase`) and default it to on.

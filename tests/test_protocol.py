@@ -224,93 +224,191 @@ def test_supervision_notes() -> None:
 
 
 def test_delegation() -> None:
-    print("\ndelegation: downward and sideways")
+    print("\ndelegation: down, sideways, and up to specialists")
     import os
-    check("codex ladder is most-capable-first", ab.codex_model_tiers()[0].endswith("sol"),
-          "cache order IS the capability order: sol > terra > luna")
+    REASON = "need a stronger model to settle the export-control question"
+
+    # A controlled cache, not ~/.codex: the real one varies by install and once had no
+    # sol at all, which made this test fail on one machine and pass on another.
+    import tempfile
+    saved_home = os.environ.get("CODEX_HOME")
+    with tempfile.TemporaryDirectory() as home:
+        (Path(home) / "models_cache.json").write_text(json.dumps({"models": [
+            {"slug": "gpt-reserve"}, {"slug": "gpt-5.6-sol"}, {"slug": "codex-auto-review"},
+            {"slug": "gpt-5.6-terra"}, {"slug": "gpt-5.6-luna"}]}))
+        os.environ["CODEX_HOME"] = home
+        check("codex ladder is most-capable-first",
+              ab.codex_model_tiers() == ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+              "cache order IS the capability order; gpt-reserve and codex-* are not rungs")
+    if saved_home is None:
+        os.environ.pop("CODEX_HOME", None)
+    else:
+        os.environ["CODEX_HOME"] = saved_home
     check("claude ladder ranks opus above haiku",
           ab.model_rank("claude", "claude-opus-4-8") < ab.model_rank("claude", "claude-haiku-4-5"))
     check("context-window suffix is stripped",
           ab.model_rank("claude", "claude-opus-4-8[1m]") == ab.model_rank("claude", "claude-opus-4-8"))
-    check("current opus is on the ladder", ab.model_rank("claude", "claude-opus-5[1m]") is not None,
-          "a frontier model missing from the ladder silently skips the direction check")
+    # Prefix matching: the longer id must win, or fable-5-1 ranks as fable-5.
+    check("fable 5.1 outranks fable 5",
+          ab.model_rank("claude", "claude-fable-5-1") < ab.model_rank("claude", "claude-fable-5"))
+    check("opus 5 is on the ladder", ab.model_rank("claude", "claude-opus-5[1m]") is not None,
+          "an unranked own-model silently disables the direction check")
+    check("dated snapshot ids rank as the base model",
+          ab.model_rank("claude", "claude-haiku-4-5-20251001")
+          == ab.model_rank("claude", "claude-haiku-4-5"))
+    check("bare family alias is accepted and means the latest",
+          ab.model_rank("claude", "opus") < ab.model_rank("claude", "claude-opus-5"),
+          "`--model opus` is a real thing the CLI takes")
 
-    # Capability classes are what make two vendors' ladders comparable at all.
-    cls = ab.capability_class
-    check("sol and opus are the same class", cls("gpt-5.6-sol") == cls("claude-opus-5"))
-    check("fable outranks the frontier class", cls("claude-fable-5") < cls("claude-opus-5"))
-    check("sonnet sits below opus", cls("claude-sonnet-5") > cls("claude-opus-5"))
-    check("haiku is the light class",
-          cls("claude-haiku-4-5") == ab.CAPABILITY_CLASSES.index("light"))
-    for model, want in (("grok-3-mini", "light"), ("gpt-5.4-mini", "light"),
-                        ("kimi-code/kimi-for-coding-highspeed", "light"),
-                        ("opencode/north-mini-code-free", "light")):
-        check(f"{model} classes as {want}", cls(model) == ab.CAPABILITY_CLASSES.index(want),
-              "pattern order must not let a cheap variant inherit its family's class")
-    check("unknown vendor model is unclassed", cls("totally-made-up-9000") is None)
-    check("sol <-> opus are declared peers",
-          ab.are_peers("gpt-5.6-sol", "claude-opus-5")
-          and ab.are_peers("claude-opus-5[1m]", "gpt-5.6-sol"),
-          "the pairing must hold in BOTH directions")
+    # The point of ranking claude structurally: models that do not exist yet must rank
+    # themselves, with nothing in this file to update.
+    for newer, older in (
+        ("claude-opus-5-2", "claude-opus-5"),
+        ("claude-opus-6", "claude-opus-5-2"),
+        ("claude-opus-8-33", "claude-opus-6"),
+        ("claude-opus-4-10", "claude-opus-4-8"),   # numeric, not lexical
+        ("claude-fable-7", "claude-opus-9"),       # family beats version across tiers
+        ("claude-sonnet-9", "claude-haiku-9"),
+    ):
+        check(f"{newer} outranks {older} with no list to edit",
+              ab.model_rank("claude", newer) < ab.model_rank("claude", older))
+    check("a future opus still bands as strong general-purpose",
+          ab.capability_band("claude", "claude-opus-8-33")
+          == ab.capability_band("claude", "claude-opus-5"))
+    check("a future opus hiring a future fable reads as upward",
+          ab.capability_delta("claude", "claude-opus-8-33", "claude", "claude-fable-9") > 0)
+    check("a future opus and sol are peers",
+          ab.capability_delta("claude", "claude-opus-8-33", "codex", "gpt-5.6-sol") == 0)
+    check("an unknown family stays unranked rather than guessed",
+          ab.model_rank("claude", "claude-quill-6") is None,
+          "permissive by design - the launch is allowed and logged, not silently mis-tiered")
+    check("a malformed id is still rejected",
+          ab.model_rank("claude", "claude-opuss-5") is None
+          and ab.model_rank("claude", "claude-opus-abc") is None)
+
+    # Cross-vendor comparisons go through the shared bands, not two unrelated indices.
+    check("opus 5 -> fable reads as upward",
+          ab.capability_delta("claude", "claude-opus-5", "claude", "claude-fable-5-1") > 0)
+    check("opus 5 <-> sol read as sideways in both directions",
+          ab.capability_delta("claude", "claude-opus-5", "codex", "gpt-5.6-sol") == 0
+          and ab.capability_delta("codex", "gpt-5.6-sol", "claude", "claude-opus-5[1m]") == 0)
+    check("terra -> sol reads as upward",
+          ab.capability_delta("codex", "gpt-5.6-terra", "codex", "gpt-5.6-sol") > 0)
+    check("terra -> fable reads as upward",
+          ab.capability_delta("codex", "gpt-5.6-terra", "claude", "claude-fable-5-1") > 0)
+    check("opus 5 -> haiku still reads as downward",
+          ab.capability_delta("claude", "claude-opus-5", "claude", "claude-haiku-4-5") < 0)
+    check("opus 5 -> gpt-5.4-mini reads as downward across vendors",
+          ab.capability_delta("claude", "claude-opus-5", "codex", "gpt-5.4-mini") < 0,
+          "the old per-ladder index comparison called this upward")
+    check("within one vendor the fine ladder still separates same-band models",
+          ab.capability_delta("claude", "claude-opus-5", "claude", "claude-opus-4-7") < 0)
+    check("codex bands come from the model name, aligned with claude families",
+          ab.capability_band("codex", "gpt-5.6-sol") == ab.CLAUDE_FAMILY_BANDS["opus"]
+          and ab.capability_band("codex", "gpt-5.6-terra") == ab.CLAUDE_FAMILY_BANDS["sonnet"]
+          and ab.capability_band("codex", "gpt-5.4-mini") == ab.CHEAPEST_BAND,
+          "gpt-5.4-mini must not inherit gpt-5.4's band")
+    check("only claude and codex are ranked",
+          ab.model_rank("grok", "grok-4.5") is None and ab.capability_band("kimi", "kimi-code/k3") is None)
+    check("unrankable model yields no direction",
+          ab.capability_delta("claude", "who-knows", "claude", "claude-haiku-4-5") is None)
 
     saved = {k: os.environ.get(k) for k in
-             ("AGENT_BRIDGE_JOB_ID", "AGENT_BRIDGE_MODEL", "AGENT_BRIDGE_PARENT")}
+             ("AGENT_BRIDGE_JOB_ID", "AGENT_BRIDGE_MODEL", "AGENT_BRIDGE_PARENT",
+              "AGENT_BRIDGE_MAX_ESCALATIONS")}
     try:
         os.environ.pop("AGENT_BRIDGE_JOB_ID", None)
-        ab._helpers_launched = 0
+        ab._helpers_launched = ab._escalations_launched = 0
         ab.enforce_delegation("claude", "claude-opus-4-8")
         check("top-level launches are unrestricted", True)
 
-        # An Opus subagent: may go sideways to Sol or to another frontier model,
-        # down to sonnet/haiku, but not up to fable.
         os.environ.update({"AGENT_BRIDGE_JOB_ID": "J", "AGENT_BRIDGE_MODEL": "claude-opus-5[1m]",
                            "AGENT_BRIDGE_PARENT": "claude"})
+        os.environ.pop("AGENT_BRIDGE_MAX_ESCALATIONS", None)
+
+        # Sideways and downward spend the helper budget and need no reason.
         for label, kind, model in (("sideways to Sol", "codex", "gpt-5.6-sol"),
                                    ("sideways to a peer opus", "claude", "claude-opus-4-8"),
                                    ("downward to sonnet", "claude", "claude-sonnet-5"),
                                    ("downward to haiku", "claude", "claude-haiku-4-5")):
-            ab._helpers_launched = 0
+            ab._helpers_launched = ab._escalations_launched = 0
             try:
                 ab.enforce_delegation(kind, model)
-                check(f"opus may delegate {label}", True)
+                check(f"opus may delegate {label}",
+                      ab._helpers_launched == 1 and ab._escalations_launched == 0)
             except (RuntimeError, ValueError) as exc:
                 check(f"opus may delegate {label}", False, str(exc))
-        ab._helpers_launched = 0
-        try:
-            ab.enforce_delegation("claude", "claude-fable-5")
-            check("opus blocked from delegating upward", False, "allowed")
-        except RuntimeError as exc:
-            check("opus blocked from delegating upward", "not upward" in str(exc))
 
         # And the reverse pairing: Sol may hand work to Opus.
         os.environ.update({"AGENT_BRIDGE_MODEL": "gpt-5.6-sol", "AGENT_BRIDGE_PARENT": "codex"})
-        ab._helpers_launched = 0
+        ab._helpers_launched = ab._escalations_launched = 0
         try:
             ab.enforce_delegation("claude", "claude-opus-5")
-            check("Sol may delegate sideways to Opus", True)
+            check("Sol may delegate sideways to Opus", ab._helpers_launched == 1)
         except (RuntimeError, ValueError) as exc:
             check("Sol may delegate sideways to Opus", False, str(exc))
-        ab._helpers_launched = 0
-        try:
-            ab.enforce_delegation("claude", "claude-fable-5")
-            check("Sol still blocked from delegating upward", False, "allowed")
-        except RuntimeError as exc:
-            check("Sol still blocked from delegating upward", "not upward" in str(exc))
 
-        os.environ["AGENT_BRIDGE_MODEL"] = "claude-sonnet-5"
-        ab._helpers_launched = 0
+        # Upward is allowed, but only deliberately: it needs a real reason.
+        for own_kind, own, label, kind, model in (
+            ("claude", "claude-opus-5[1m]", "opus hiring fable", "claude", "claude-fable-5-1"),
+            ("codex", "gpt-5.6-sol", "sol hiring fable", "claude", "claude-fable-5-1"),
+        ):
+            os.environ.update({"AGENT_BRIDGE_MODEL": own, "AGENT_BRIDGE_PARENT": own_kind})
+            ab._helpers_launched = ab._escalations_launched = 0
+            try:
+                ab.enforce_delegation(kind, model)
+                check(f"{label} needs a reason", False, "allowed with no reason")
+            except ValueError as exc:
+                check(f"{label} needs a reason", "specialist_reason" in str(exc))
+            try:
+                ab.enforce_delegation(kind, model, "why")
+                check(f"{label} rejects a token reason", False, "allowed")
+            except ValueError:
+                check(f"{label} rejects a token reason", True)
+            ab.enforce_delegation(kind, model, REASON)
+            check(f"{label} allowed with a reason",
+                  ab._escalations_launched == 1 and ab._helpers_launched == 0,
+                  "upward spends the specialist budget, not the helper budget")
+        # Terra hiring Sol and Fable - the same affordance from the codex side.
+        os.environ.update({"AGENT_BRIDGE_MODEL": "gpt-5.6-terra", "AGENT_BRIDGE_PARENT": "codex"})
+        os.environ["AGENT_BRIDGE_MAX_ESCALATIONS"] = "2"
+        ab._helpers_launched = ab._escalations_launched = 0
+        ab.enforce_delegation("codex", "gpt-5.6-sol", REASON)
+        ab.enforce_delegation("claude", "claude-fable-5-1", REASON)
+        check("terra may hire sol and fable", ab._escalations_launched == 2)
+        try:
+            ab.enforce_delegation("codex", "gpt-5.6-sol", REASON)
+            check("specialist budget is enforced", False, "allowed")
+        except RuntimeError as exc:
+            check("specialist budget is enforced", "specialist limit reached" in str(exc))
+
+        os.environ["AGENT_BRIDGE_MAX_ESCALATIONS"] = "0"
+        ab._escalations_launched = 0
+        try:
+            ab.enforce_delegation("codex", "gpt-5.6-sol", REASON)
+            check("escalations can be switched off", False, "allowed")
+        except RuntimeError as exc:
+            check("escalations can be switched off", "disabled" in str(exc))
+        os.environ.pop("AGENT_BRIDGE_MAX_ESCALATIONS")
+
+        os.environ.update({"AGENT_BRIDGE_MODEL": "claude-opus-5", "AGENT_BRIDGE_PARENT": "claude"})
         try:
             ab.enforce_delegation("claude", None)
             check("subagent must name a model", False, "allowed")
         except ValueError:
             check("subagent must name a model", True)
         try:
-            ab.enforce_delegation("claude", "definitely-not-a-model")
-            check("unknown model refused", False, "allowed")
+            ab.enforce_delegation("claude", "claude-imaginary-9")
+            check("unknown model rejected", False, "allowed")
         except ValueError as exc:
-            check("unknown model refused", "unknown model" in str(exc))
+            check("unknown model rejected", "unknown model" in str(exc))
+        try:
+            ab.enforce_delegation("claude", "definitely-not-a-model")
+            check("unknown non-claude id refused", False, "allowed")
+        except ValueError as exc:
+            check("unknown non-claude id refused", "unknown model" in str(exc))
 
-        ab._helpers_launched = 0
+        ab._helpers_launched = ab._escalations_launched = 0
         ab.enforce_delegation("claude", "claude-haiku-4-5")
         ab.enforce_delegation("claude", "claude-haiku-4-5")
         check("two helpers allowed", ab._helpers_launched == 2)
@@ -319,14 +417,18 @@ def test_delegation() -> None:
             check("third helper blocked", False, "allowed")
         except RuntimeError as exc:
             check("third helper blocked", "limit reached" in str(exc))
+        check("helper budget does not spend the specialist budget",
+              ab._escalations_launched == 0)
 
         rendered = ab.with_ask_parent_preamble("task")
         check("preamble offers cheaper delegation", "cheaper model" in rendered.lower())
         check("preamble offers sideways delegation", "SIDEWAYS" in rendered)
-        check("preamble still forbids upward", "may NOT do is delegate" in rendered)
+        check("preamble offers hiring upward", "specialist_reason" in rendered)
         check("preamble keeps accountability", "responsible for the work" in rendered)
+        check("preamble keeps accountability when hiring up",
+              "accountable for the result" in rendered)
     finally:
-        ab._helpers_launched = 0
+        ab._helpers_launched = ab._escalations_launched = 0
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -438,6 +540,7 @@ def test_preamble_gating_sections() -> None:
         ceiling = ab.select_preamble_sections()
         check("ceiling child loses escalate", "escalate" not in ceiling)
         check("ceiling child loses delegate", "delegate" not in ceiling)
+        check("ceiling child loses specialist", "specialist" not in ceiling)
         check("ceiling child keeps the question channel", "core" in ceiling)
         check("structural gate overrides an explicit caller list",
               "delegate" not in ab.select_preamble_sections(["core", "delegate"]),
@@ -446,7 +549,14 @@ def test_preamble_gating_sections() -> None:
         os.environ["AGENT_BRIDGE_DEPTH"] = "0"
         os.environ["AGENT_BRIDGE_MAX_HELPERS"] = "0"
         check("helpers disabled drops delegate", "delegate" not in ab.select_preamble_sections())
+        check("helpers disabled keeps specialist", "specialist" in ab.select_preamble_sections(),
+              "the two budgets are independent")
         os.environ.pop("AGENT_BRIDGE_MAX_HELPERS")
+
+        os.environ["AGENT_BRIDGE_MAX_ESCALATIONS"] = "0"
+        check("escalations disabled drops specialist",
+              "specialist" not in ab.select_preamble_sections())
+        os.environ.pop("AGENT_BRIDGE_MAX_ESCALATIONS")
 
         try:
             ab.select_preamble_sections(["core", "not-a-section"])
@@ -460,7 +570,8 @@ def test_preamble_gating_sections() -> None:
         check("minimal is materially smaller", len(small) < len(big) * 0.7)
         for name in ab.PREAMBLE_ORDER:
             rendered = ab.PREAMBLE_SECTIONS[name].format(
-                tool="T", notes_tool="N", concern_tool="C", warm_tool="W", max_helpers=2)
+                tool="T", notes_tool="N", concern_tool="C", warm_tool="W", max_helpers=2,
+                max_escalations=1)
             check(f"section '{name}' renders with no stray placeholder", "{" not in rendered)
 
         cmd_args = {"prompt": "t", "cwd": "/tmp", "multi_phase": False}

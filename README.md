@@ -67,7 +67,7 @@ allowlist): `ask_parent` (blocking question), `check_notes` / `send_note`
 - **Codex reads AGENTS.md, not CLAUDE.md** — every codex prompt gets a
   preamble redirecting it to the repo's CLAUDE.md.
 - **Preambles are assembled per-launch** from sections (core / abort /
-  escalate / delegate / notes / concerns / standing), structurally gated so
+  escalate / delegate / specialist / notes / concerns / standing), structurally gated so
   a child is never advertised a door that's locked (e.g. at max depth it is
   not told how to delegate). `multi_phase: false` drops the notes channel
   for one-shots.
@@ -79,6 +79,10 @@ allowlist): `ask_parent` (blocking question), `check_notes` / `send_note`
   structure (write handoff / merge+verify / report) for multi-step work.
   Model tiers: `deepseek/deepseek-v4-flash` (paid direct API),
   `opencode/deepseek-v4-flash-free` (free tier fallback).
+- A subagent may launch `AGENT_BRIDGE_MAX_HELPERS=2` agents at or below its own
+  capability tier, and hire `AGENT_BRIDGE_MAX_ESCALATIONS=1` above it (that one needs a
+  `specialist_reason`). Only claude and codex models are ranked. See
+  [USAGE.md](USAGE.md), "Delegating down, sideways, and hiring up".
 - `AGENT_BRIDGE_MAX_DEPTH=2` bounds recursive delegation. Binary overrides:
   `CODEX_BIN`, `CLAUDE_BIN`, `OPENCODE_BIN`, etc.
 
