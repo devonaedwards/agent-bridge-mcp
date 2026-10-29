@@ -3476,6 +3476,37 @@ def enrich_sync_result(kind: str, result: dict[str, Any], meta: dict[str, Any]) 
     return result
 
 
+def run_command(kind: str, command: list[str], prompt: str | None, cwd: str, timeout_seconds: int, max_output_chars: int) -> dict[str, Any]:
+    # Restored 28 Oct 2026: 3a5d215 deleted this while every run_* handler still calls it.
+    enforce_depth()
+    started_at = time.time()
+    feeds_stdin = command[-1] == "-"
+    run_kwargs: dict[str, Any] = dict(
+        cwd=cwd,
+        env=child_env(kind),
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+    if feeds_stdin:
+        run_kwargs["input"] = prompt
+    else:
+        # DEVNULL, not inherited: keep a stdin-reading subagent off the server's stdin.
+        run_kwargs["stdin"] = subprocess.DEVNULL
+    completed = subprocess.run(command, **run_kwargs)
+    finished_at = time.time()
+    return {
+        "kind": kind,
+        "status": "succeeded" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "elapsed_seconds": round(finished_at - started_at, 3),
+        "cwd": cwd,
+        "command": command_preview(command),
+        "stdout": truncate_text(completed.stdout, max_output_chars),
+        "stderr": truncate_text(completed.stderr, max_output_chars),
+    }
+
+
 def run_codex(args: dict[str, Any]) -> dict[str, Any]:
     command, prompt, cwd, timeout_seconds, meta = build_codex_command(args)
     enforce_delegation("codex", meta.get("model"))
